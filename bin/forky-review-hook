@@ -91,7 +91,7 @@ LOG_DIR="$HOME/.forky"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/reviews.jsonl"
 {
-  jq -n \
+  jq -cn \
     --arg ts "$(date -u +%FT%TZ)" \
     --arg path "$FILE_PATH" \
     --arg tool "$TOOL_NAME" \
