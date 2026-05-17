@@ -1,0 +1,25 @@
+{
+  "name": "forky",
+  "version": "0.1.0",
+  "description": "Local proxy splitting Claude Code: OAuth Opus for planning, any OpenAI-compatible endpoint for execution",
+  "repository": { "type": "git", "url": "https://github.com/vladharl/forky.git" },
+  "license": "MIT",
+  "author": "Vlad Harlamov",
+  "keywords": ["claude-code", "anthropic", "oauth", "proxy", "llm", "openai-compatible"],
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun --watch run src/server.ts",
+    "test": "bun test",
+    "build": "bun build src/server.ts --compile --outfile bin/forky"
+  },
+  "dependencies": {
+    "hono": "^4.6.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@anthropic-ai/sdk": "^0.30.0",
+    "openai": "^4.70.0"
+  }
+}

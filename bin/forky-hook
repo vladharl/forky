@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Claude Code UserPromptSubmit hook: toggles forky's Opus sentinel based on
+# the session's permission_mode. Plan mode → Opus on, anything else → off.
+#
+# Wired into ~/.claude/settings.json under hooks.UserPromptSubmit. Must always
+# exit 0 quickly — anything else blocks the prompt submission.
+
+FLAG="$HOME/.forky/opus"
+LOG="$HOME/.forky/hook.log"
+mkdir -p "$(dirname "$FLAG")"
+
+PAYLOAD=$(cat)
+
+# Always log the most recent payload (small) for debugging; truncate to 1 line.
+{
+  echo "[$(date -u +%FT%TZ)] $PAYLOAD"
+} >> "$LOG" 2>/dev/null
+# Keep log bounded to last 200 lines.
+if [ -f "$LOG" ]; then
+  tail -200 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+
+MODE=$(printf '%s' "$PAYLOAD" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(d.get('permission_mode') or d.get('permissionMode') or '')
+except Exception:
+    print('')
+" 2>/dev/null)
+
+if [ "$MODE" = "plan" ]; then
+  touch "$FLAG"
+else
+  rm -f "$FLAG"
+fi
+
+exit 0

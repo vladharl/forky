@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Toggle Opus routing on/off. When on, all execution traffic that would normally
+# hit AI Stack qwen-35b is forced to claude-opus-4-7 via your OAuth subscription.
+# Auto-expires after 4h.
+
+set -e
+FLAG="$HOME/.forky/opus"
+mkdir -p "$(dirname "$FLAG")"
+
+case "${1:-status}" in
+  on)
+    touch "$FLAG"
+    echo "→ Opus routing ON  (sentinel: $FLAG, auto-expires in 4h)"
+    ;;
+  off)
+    rm -f "$FLAG"
+    echo "→ Opus routing OFF (sentinel removed; back to qwen-35b)"
+    ;;
+  status)
+    if [ -f "$FLAG" ]; then
+      mtime=$(stat -f %m "$FLAG")
+      now=$(date +%s)
+      age=$(( now - mtime ))
+      remaining=$(( 14400 - age ))
+      if [ $remaining -le 0 ]; then
+        echo "→ sentinel present but EXPIRED (age ${age}s, removing)"
+        rm -f "$FLAG"
+      else
+        echo "→ Opus routing ON  (${remaining}s remaining)"
+      fi
+    else
+      echo "→ Opus routing OFF (default: qwen-35b)"
+    fi
+    ;;
+  *)
+    echo "usage: forky-opus [on|off|status]"
+    exit 1
+    ;;
+esac

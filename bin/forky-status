@@ -1,0 +1,25 @@
+#!/usr/bin/env bun
+import { readFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const FILE = join(homedir(), ".forky", "status.json");
+
+if (!existsSync(FILE)) {
+  console.error("forky is not running (no status.json at " + FILE + ")");
+  process.exit(1);
+}
+
+const status = JSON.parse(readFileSync(FILE, "utf8"));
+const upMs = Date.now() - new Date(status.startedAt).getTime();
+const upMin = Math.floor(upMs / 60000);
+
+const dot = status.circuit.state === "closed" ? "●" : status.circuit.state === "half-open" ? "◐" : "○";
+
+console.log(`forky pid=${status.pid} port=${status.port} up=${upMin}m`);
+console.log(`  ${dot} circuit:    ${status.circuit.state}  failures=${status.circuit.failureCount}` +
+  (status.circuit.openedAt ? `  opened=${new Date(status.circuit.openedAt).toISOString()}` : ""));
+console.log(`  requests:     ${status.requests}`);
+console.log(`  AI Stack fails: ${status.aiStackFailures}`);
+console.log(`  fallbacks → OAuth: ${status.fallbacksToOauth}`);
+console.log(`  last update:  ${status.lastUpdated}`);

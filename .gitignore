@@ -1,0 +1,22 @@
+node_modules/
+*.log
+*.tsbuildinfo
+
+# Local runtime state (lives in ~/.forky/, but ignore any stray copies)
+.forky/
+debug/
+fixtures/*.json
+fixtures/*.txt
+
+# Editor / OS junk
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets — should never appear, but belt + suspenders
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials.json
