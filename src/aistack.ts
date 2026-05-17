@@ -5,7 +5,7 @@ import { SseTranslator, readSseStream, sseEvent } from "./translate/sse.ts";
 import { withWatchdog, WatchdogTimeoutError } from "./resilience/watchdog.ts";
 import { Semaphore, withSemaphore } from "./resilience/semaphore.ts";
 import { fetchWithRetryOn429 } from "./resilience/retry.ts";
-import { looksLikeXmlToolCall, rectifyToolCalls } from "./translate/reformat.ts";
+import { looksLikeXmlToolCall, rectifyToolCalls, rectifyToolCallsStreaming } from "./translate/reformat.ts";
 import { forwardOAuthAsFallback, type AnthropicBody } from "./anthropic.ts";
 import { log } from "./log.ts";
 
@@ -369,33 +369,68 @@ async function dispatchWithRectifier(
 
         // Optionally rectify XML tool emissions.
         const msg = primary.choices[0].message;
-        let content = msg.content ?? "";
-        let toolCalls = msg.tool_calls ?? null;
+        const primaryContent = msg.content ?? "";
         const toolNames = (translated.tools ?? []).map((t) => t.function.name);
+        const needsRectify =
+          looksLikeXmlToolCall(primaryContent, toolNames)
+          && translated.tools && translated.tools.length > 0;
 
-        if (looksLikeXmlToolCall(content, toolNames) && translated.tools && translated.tools.length > 0) {
-          log("info", "reformat.start", { contentChars: content.length });
+        if (needsRectify && translated.tools) {
+          // STREAMING rectifier path: pipe gemma's response through SseTranslator
+          // so Claude Code starts seeing tool_use events as they're generated,
+          // instead of waiting for gemma to fully complete.
+          log("info", "reformat.start", { contentChars: primaryContent.length, mode: "streaming" });
           const rectTimeout = AbortSignal.timeout(REFORMAT_RECTIFIER_TIMEOUT_MS);
-          const rect = await rectifyToolCalls(content, translated.tools, env, reformatModel, rectTimeout)
-            .catch((e: Error) => {
-              log("error", "rectifier.error", { err: e.message });
-              return { content, tool_calls: null };
-            });
-          if (rect.tool_calls && rect.tool_calls.length > 0) {
-            content = rect.content;
-            toolCalls = rect.tool_calls;
-            log("info", "reformat.applied", { toolCallCount: rect.tool_calls.length });
-          } else {
-            log("warn", "reformat.no_tool_calls_returned");
+          const gemmaStream = await rectifyToolCallsStreaming(primaryContent, translated.tools, env, reformatModel, rectTimeout);
+
+          if (gemmaStream) {
+            waiting = false;
+            const translator = new SseTranslator(req.model);
+            let emittedAny = false;
+            try {
+              for await (const chunk of readSseStream(gemmaStream.body)) {
+                if (chunk === "[DONE]") break;
+                const out = translator.push(chunk);
+                if (out) { sendStr(out); emittedAny = true; }
+              }
+              sendStr(translator.finish());
+              log("info", "reformat.applied", { mode: "streaming", emittedAny });
+              resolveOutcome("ok");
+              return;
+            } catch (e) {
+              log("error", "rectifier.stream_error", { err: (e as Error).message });
+              // fall through to terminal sequence
+              sendStr(translator.finish({ appendText: `\n\n[forky: rectifier stream error: ${(e as Error).message}]` }));
+              resolveOutcome("stream_error");
+              return;
+            }
           }
+
+          // Streaming gemma failed (preflight). Fall back to non-streaming gemma.
+          log("warn", "rectifier.streaming_unavailable_falling_back_nonstreaming");
+          const rect = await rectifyToolCalls(primaryContent, translated.tools, env, reformatModel, rectTimeout)
+            .catch((e: Error) => { log("error", "rectifier.error", { err: e.message }); return { content: primaryContent, tool_calls: null }; });
+          waiting = false;
+          sendStr(buildAnthropicSseString({
+            requestedModel: req.model,
+            rawId: primary.id,
+            content: rect.tool_calls && rect.tool_calls.length > 0 ? rect.content : primaryContent,
+            toolCalls: rect.tool_calls && rect.tool_calls.length > 0 ? rect.tool_calls : (msg.tool_calls ?? null),
+            inputTokens: primary.usage?.prompt_tokens ?? 0,
+            outputTokens: primary.usage?.completion_tokens ?? 0,
+            finishReason: primary.choices[0].finish_reason,
+          }));
+          resolveOutcome("ok");
+          return;
         }
 
+        // No XML detected → emit primary's response as synthesized Anthropic SSE.
         waiting = false;
         sendStr(buildAnthropicSseString({
           requestedModel: req.model,
           rawId: primary.id,
-          content,
-          toolCalls,
+          content: primaryContent,
+          toolCalls: msg.tool_calls ?? null,
           inputTokens: primary.usage?.prompt_tokens ?? 0,
           outputTokens: primary.usage?.completion_tokens ?? 0,
           finishReason: primary.choices[0].finish_reason,

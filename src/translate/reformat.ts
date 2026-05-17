@@ -43,6 +43,56 @@ export type RectifierResult = {
   tool_calls: OpenAiToolCall[] | null;
 };
 
+/**
+ * Streaming variant: returns gemma's raw response body (OpenAI SSE bytes) so
+ * the caller can pipe each chunk through SseTranslator and emit Anthropic
+ * events as they arrive. Saves ~1-2s of visible latency on rectifier turns
+ * vs buffering. Returns null on any error — caller should fall back to the
+ * non-streaming rectifyToolCalls() or emit a terminal error.
+ */
+export async function rectifyToolCallsStreaming(
+  rawContent: string,
+  tools: ReadonlyArray<OpenAiTool>,
+  env: AiStackEnv,
+  reformatModel: string,
+  signal?: AbortSignal,
+): Promise<{ body: ReadableStream<Uint8Array> } | null> {
+  const body = {
+    model: reformatModel,
+    stream: true,
+    max_tokens: 2000,
+    tools_enabled: false,
+    tools,
+    messages: [
+      { role: "system", content: RECTIFIER_SYSTEM_PROMPT },
+      { role: "user", content: rawContent },
+    ],
+  };
+
+  let res: Response;
+  try {
+    res = await execFetch(`${env.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "authorization": `Bearer ${env.apiKey}`,
+        "accept": "text/event-stream",
+      },
+      body: JSON.stringify(body),
+      signal,
+    }, "aistack.rectifier.gemma");
+  } catch (e) {
+    log("error", "reformat.streaming_fetch_failed", { err: (e as Error).message });
+    return null;
+  }
+  if (!res.ok || !res.body) {
+    log("error", "reformat.streaming_upstream_error", { status: res.status });
+    await res.text().catch(() => "");
+    return null;
+  }
+  return { body: res.body };
+}
+
 export async function rectifyToolCalls(
   rawContent: string,
   tools: ReadonlyArray<OpenAiTool>,
