@@ -10,7 +10,8 @@ export function translateResponse(res: AiStackResponse, requestedModel: string):
 
   const content: AnthropicResponse["content"] = [];
   if (msg.content && msg.content.length > 0) {
-    content.push({ type: "text", text: msg.content });
+    const cleaned = stripEndTokens(msg.content);
+    if (cleaned.length > 0) content.push({ type: "text", text: cleaned });
   }
   if (msg.tool_calls != null && msg.tool_calls.length > 0) {
     for (const tc of msg.tool_calls) {
@@ -42,6 +43,13 @@ export function translateResponse(res: AiStackResponse, requestedModel: string):
       output_tokens: res.usage?.completion_tokens ?? 0,
     },
   };
+}
+
+// Strip end-of-sequence tokens that some open-weight models leak into content
+// (gemma: `<eos>`; llama variants: `<|eot_id|>`, `<|end_of_text|>`; etc.).
+const END_TOKEN_PATTERN = /<\/?(eos|s|end_of_text)>|<\|(?:eot_id|end_of_text|im_end|endoftext)\|>/gi;
+function stripEndTokens(s: string): string {
+  return s.replace(END_TOKEN_PATTERN, "");
 }
 
 function mapFinishReason(fr: AiStackResponse["choices"][number]["finish_reason"]): AnthropicResponse["stop_reason"] {

@@ -41,15 +41,36 @@ export type TranslateOptions = {
  * (OpenAI Chat Completions) request body, with qwen-35b pinned and
  * server-side tools disabled. Validated against AiStackRequest schema.
  */
+// Counter-instruction appended to the system prompt. Claude Code's prompt
+// contains <function_calls><invoke name="X">...</invoke></function_calls> XML
+// examples (Anthropic's internal tool-call format). Models like qwen-35b mimic
+// that pattern instead of using the OpenAI tool_calls field, so the proxy
+// receives text like `<Read path="...">` that never invokes anything.
+// This override forces structured function-calling and survives the noisy
+// prompt by being last and explicit. Override via EXEC_TOOL_FORMAT_NUDGE="".
+const DEFAULT_TOOL_NUDGE =
+  "\n\n# CRITICAL: Tool-call format override\n" +
+  "When you need to use a tool, you MUST emit it via the API's structured `tool_calls` field. " +
+  "Do NOT output `<function_calls>`, `<invoke>`, `<parameter>`, or any other XML/HTML tags in your text content — " +
+  "they will NOT be executed and will leak as visible text to the user. " +
+  "The XML examples earlier in this system prompt are illustrative of Claude's internal format; this API uses OpenAI-style function calling only. " +
+  "If you intend to call a tool, return a structured function call. Otherwise just write plain text.";
+
+const TOOL_NUDGE = process.env.EXEC_TOOL_FORMAT_NUDGE ?? DEFAULT_TOOL_NUDGE;
+
 export function translateRequest(req: AnthropicRequest, opts: TranslateOptions): AiStackRequest {
   const messages: OpenAiMessage[] = [];
 
-  // System prompt: flatten string-or-array form into one OpenAI system message.
+  // System prompt: flatten string-or-array form into one OpenAI system message,
+  // then append the tool-format override so it has maximum recency.
   if (req.system != null) {
     const sysText = typeof req.system === "string"
       ? req.system
       : req.system.map((b) => b.text).join("\n\n");
-    if (sysText.length > 0) messages.push({ role: "system", content: sysText });
+    const finalSys = (sysText + (req.tools && req.tools.length > 0 ? TOOL_NUDGE : "")).trim();
+    if (finalSys.length > 0) messages.push({ role: "system", content: finalSys });
+  } else if (req.tools && req.tools.length > 0) {
+    messages.push({ role: "system", content: TOOL_NUDGE.trim() });
   }
 
   for (const msg of req.messages) {

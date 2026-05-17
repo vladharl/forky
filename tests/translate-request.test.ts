@@ -65,7 +65,10 @@ describe("translateRequest", () => {
       tools: [{ name: "Bash", description: "shell", input_schema: { type: "object" } }],
     });
     const out = translateRequest(req, { stream: false });
-    expect(out.messages).toEqual([
+    // First message is the auto-injected tool-format nudge (because tools are present).
+    expect(out.messages[0].role).toBe("system");
+    expect((out.messages[0] as { content: string }).content).toContain("Tool-call format override");
+    expect(out.messages.slice(1)).toEqual([
       { role: "user", content: "ls" },
       { role: "assistant", content: "running", tool_calls: [
         { id: "tu_1", type: "function", function: { name: "Bash", arguments: '{"command":"ls"}' } },
@@ -75,6 +78,31 @@ describe("translateRequest", () => {
     expect(out.tools).toEqual([
       { type: "function", function: { name: "Bash", description: "shell", parameters: { type: "object" } } },
     ]);
+  });
+
+  test("tool-format nudge is NOT injected when no tools are declared", () => {
+    const req = parseReq({
+      model: "claude-sonnet-4-6",
+      max_tokens: 50,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const out = translateRequest(req, { stream: false });
+    expect(out.messages.find((m) => m.role === "system")).toBeUndefined();
+  });
+
+  test("tool-format nudge is appended to existing system prompt when tools are declared", () => {
+    const req = parseReq({
+      model: "claude-sonnet-4-6",
+      max_tokens: 50,
+      system: "be terse",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ name: "Read", input_schema: {} }],
+    });
+    const out = translateRequest(req, { stream: false });
+    const sys = out.messages[0] as { role: "system"; content: string };
+    expect(sys.role).toBe("system");
+    expect(sys.content.startsWith("be terse")).toBe(true);
+    expect(sys.content).toContain("Tool-call format override");
   });
 
   test("image block becomes data URL image_url part", () => {

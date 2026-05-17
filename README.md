@@ -155,7 +155,12 @@ Covers request translation, response translation, SSE streaming with tool calls,
 - **macOS only** for now. The Keychain shell-out is the non-portable piece; a Linux variant reading `~/.claude/.credentials.json` is straightforward but unwritten.
 - **Plan-mode auto-detection requires the hook**. Plan mode leaves no trace in the API request — without `forky-hook` wired into Claude Code settings, you'll need `forky-opus on/off` for manual switching.
 - **Claude Code's `/model` picker stays disabled** because `ANTHROPIC_BASE_URL` is set. opusplan-style behavior comes from the hook + sentinel mechanism, not Claude Code's built-in alias.
-- **Tool-call fidelity depends on your execution model**. Models that mis-format tool arguments get their malformed calls dropped with a `[forky: dropped malformed tool call ...]` text note rather than emit invalid JSON. Stronger function-calling models give better UX.
+- **Tool-call fidelity depends on your execution model**. Many open-weight models (including qwen-2.5/3 variants) **mimic the XML tool-call examples** in Claude Code's system prompt (`<function_calls><invoke name="X">...</invoke></function_calls>`) instead of using the OpenAI `tool_calls` field. Their "tool invocations" show up as plain text and never execute. Forky injects a strong counter-instruction in the system prompt, but it's not always enough. Models tested:
+    - ✅ `gemma-micro` / Gemma-family — proper function calls even under aggressive XML priming
+    - ✅ `gpt-4o-mini`, `claude-haiku` via API — proper function calls
+    - ❌ `qwen-35b`, `qwen-27b` — emit XML; tools don't execute through Claude Code
+  - Pick a backend model that's strong at OpenAI function-calling. If you must use a model that emits XML, expect tool-heavy work to fail until you write a custom converter.
+- **End-of-sequence tokens** like `<eos>`, `<|eot_id|>`, `<|end_of_text|>` are stripped from streamed content — some open-weight models leak them.
 - **`context_management` body field** is stripped on the OAuth path — Anthropic's OAuth endpoint 400s on it. Claude Code's local context auto-edit still works; only the API-side context-management feature is disabled.
 
 ## Terms of service note

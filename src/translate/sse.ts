@@ -111,10 +111,11 @@ export class SseTranslator {
       this.started = true;
     }
 
-    // Drop reasoning_content silently (qwen-35b's thinking tokens).
+    // Drop reasoning_content silently (qwen's thinking tokens).
 
     if (typeof delta.content === "string" && delta.content.length > 0) {
-      out += this.handleText(delta.content);
+      const cleaned = stripEndTokens(delta.content);
+      if (cleaned.length > 0) out += this.handleText(cleaned);
     }
 
     if (delta.tool_calls && delta.tool_calls.length > 0) {
@@ -272,4 +273,12 @@ function mapFinishReason(
     case "content_filter": return "end_turn";
     case null: return "end_turn";
   }
+}
+
+// Some open-weight models leak their end-of-sequence tokens into the streamed
+// content (gemma emits "<eos>", llama variants sometimes emit "<|eot_id|>",
+// etc.). Filter these so they don't pollute the assistant message.
+const END_TOKEN_PATTERN = /<\/?(eos|s|end_of_text)>|<\|(?:eot_id|end_of_text|im_end|endoftext)\|>/gi;
+function stripEndTokens(s: string): string {
+  return s.replace(END_TOKEN_PATTERN, "");
 }
