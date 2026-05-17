@@ -143,6 +143,24 @@ describe("translateRequest", () => {
     }
   });
 
+  test("strips orchestration tools (Agent, TodoWrite, ExitPlanMode, etc.)", () => {
+    const req = parseReq({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      messages: [{ role: "user", content: "x" }],
+      tools: [
+        { name: "Read", input_schema: {} },
+        { name: "Agent", input_schema: {} },
+        { name: "TodoWrite", input_schema: {} },
+        { name: "Bash", input_schema: {} },
+        { name: "ExitPlanMode", input_schema: {} },
+      ],
+    });
+    const out = translateRequest(req, { stream: false });
+    const names = (out.tools ?? []).map((t) => t.function.name).sort();
+    expect(names).toEqual(["Bash", "Read"]);
+  });
+
   test("validate:false skips schema check (fast path)", () => {
     const req = parseReq({
       model: "x", max_tokens: 1,

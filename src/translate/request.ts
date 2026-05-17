@@ -5,6 +5,24 @@ import { AiStackRequest as AiStackRequestSchema } from "../schemas.ts";
 // proxy is not tied to one specific OpenAI-compatible provider.
 const EXECUTION_MODEL = process.env.EXEC_MODEL ?? process.env.AISTACK_MODEL ?? "qwen-35b";
 
+// Tools to strip when routing to the execution backend. These are orchestration
+// tools meant for the planner (Opus) — when an execution model invokes them,
+// it either spawns another execution-model sub-agent (defeating the split) or
+// hallucinates arguments. Override with EXEC_STRIPPED_TOOLS=Foo,Bar.
+const DEFAULT_STRIPPED_TOOLS = [
+  "Agent",            // spawns sub-agents — only useful to a planner
+  "TodoWrite",        // planning artifact
+  "AskUserQuestion",  // routes back to the user via Claude Code main loop
+  "ExitPlanMode",     // mode toggle — no effect from execution side
+  "EnterPlanMode",
+  "ScheduleWakeup",
+  "TaskOutput",
+  "TaskStop",
+];
+const STRIPPED_TOOLS = new Set(
+  (process.env.EXEC_STRIPPED_TOOLS?.split(",").map((s) => s.trim()).filter(Boolean) ?? DEFAULT_STRIPPED_TOOLS),
+);
+
 type OpenAiMessage =
   | { role: "system"; content: string }
   | { role: "user"; content: string | Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> }
@@ -88,10 +106,12 @@ export function translateRequest(req: AnthropicRequest, opts: TranslateOptions):
     }
   }
 
-  const tools: OpenAiTool[] | undefined = req.tools?.map((t) => ({
-    type: "function" as const,
-    function: { name: t.name, description: t.description, parameters: t.input_schema ?? {} },
-  }));
+  const tools: OpenAiTool[] | undefined = req.tools
+    ?.filter((t) => !STRIPPED_TOOLS.has(t.name))
+    .map((t) => ({
+      type: "function" as const,
+      function: { name: t.name, description: t.description, parameters: t.input_schema ?? {} },
+    }));
 
   const out: AiStackRequest = {
     model: EXECUTION_MODEL,
