@@ -18,20 +18,42 @@ const REFORMAT_RECTIFIER_TIMEOUT_MS = Number(process.env.FORKY_REFORMAT_RECTIFIE
 // by intermediate proxies / OS timeouts while we're waiting on the primary.
 const HEARTBEAT_MS = Number(process.env.FORKY_HEARTBEAT_MS ?? 5_000);
 
-// Concurrency limiter for outbound execution-backend calls. AI Stack's qwen
-// services cap at 4 concurrent; bursts beyond that 429. Forky queues here so
-// AI Stack never sees a burst. Configurable via env.
-const EXEC_MAX_CONCURRENT = Number(process.env.FORKY_EXEC_MAX_CONCURRENT ?? 4);
+// Per-provider concurrency limits. AI Stack's qwen services cap at 4
+// concurrent; gemma at 8. Sharing one semaphore would throttle gemma behind
+// qwen, so we maintain a small lookup keyed by the call site's label.
+const EXEC_PRIMARY_MAX_CONCURRENT = Number(process.env.FORKY_EXEC_PRIMARY_MAX_CONCURRENT ?? process.env.FORKY_EXEC_MAX_CONCURRENT ?? 4);
+const EXEC_RECTIFIER_MAX_CONCURRENT = Number(process.env.FORKY_EXEC_RECTIFIER_MAX_CONCURRENT ?? 8);
 const EXEC_429_ATTEMPTS = Number(process.env.FORKY_EXEC_429_ATTEMPTS ?? 3);
 const EXEC_429_BASE_DELAY_MS = Number(process.env.FORKY_EXEC_429_BASE_DELAY_MS ?? 250);
-export const execSemaphore = new Semaphore(EXEC_MAX_CONCURRENT);
+
+const primarySemaphore = new Semaphore(EXEC_PRIMARY_MAX_CONCURRENT);
+const rectifierSemaphore = new Semaphore(EXEC_RECTIFIER_MAX_CONCURRENT);
 
 /**
- * fetch() through the execution-backend semaphore, with 429 retry+backoff.
- * Use this for every outbound call to the EXEC_BASE_URL (primary + rectifier).
+ * Back-compat export for callers that want a single snapshot. New code should
+ * read getExecSemaphoreSnapshots() for per-provider visibility.
+ */
+export const execSemaphore = primarySemaphore;
+
+export function getExecSemaphoreSnapshots() {
+  return {
+    primary: primarySemaphore.snapshot(),
+    rectifier: rectifierSemaphore.snapshot(),
+  };
+}
+
+function pickSemaphore(label: string): Semaphore {
+  return label.includes("rectifier.gemma") ? rectifierSemaphore : primarySemaphore;
+}
+
+/**
+ * fetch() through the appropriate execution-backend semaphore, with 429
+ * retry+backoff. Use this for every outbound call to the EXEC_BASE_URL.
+ * Label suffix "rectifier.gemma" routes to the gemma pool; everything else
+ * goes through the primary (qwen) pool.
  */
 export async function execFetch(url: string, init: RequestInit, label: string): Promise<Response> {
-  return withSemaphore(execSemaphore, () =>
+  return withSemaphore(pickSemaphore(label), () =>
     fetchWithRetryOn429(url, init, {
       maxAttempts: EXEC_429_ATTEMPTS,
       baseDelayMs: EXEC_429_BASE_DELAY_MS,

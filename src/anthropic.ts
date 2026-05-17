@@ -27,7 +27,7 @@ export async function forwardOAuth(
   signal?: AbortSignal,
   clientHeaders?: Record<string, string>,
 ): Promise<Response> {
-  const prepared = stripUnsupportedFields(injectSystemBlock(body));
+  const prepared = addCachingMarkers(stripUnsupportedFields(injectSystemBlock(body)));
   let token = await getAccessToken();
   let res = await callAnthropic(token, prepared, signal, clientHeaders);
   if (res.status === 401) {
@@ -42,6 +42,38 @@ function stripUnsupportedFields(body: AnthropicBody): AnthropicBody {
   const out: AnthropicBody = { ...body };
   for (const f of STRIP_BODY_FIELDS) {
     if (f in out) delete (out as Record<string, unknown>)[f];
+  }
+  return out;
+}
+
+/**
+ * Add `cache_control: { type: "ephemeral" }` to the LAST system block and the
+ * LAST tool definition. Anthropic caches everything UP TO AND INCLUDING the
+ * marked block as a single cacheable prefix (5min TTL). Claude Code's system
+ * prompt is ~30K stable tokens per session and its tools[] is another ~10K;
+ * caching them cuts plan-mode input-token usage by ~80% on warm hits, which
+ * stretches your Max subscription further. Skipped if the block already has
+ * cache_control (don't clobber Claude Code's own caching choices).
+ */
+function addCachingMarkers(body: AnthropicBody): AnthropicBody {
+  const out: AnthropicBody = { ...body };
+  if (Array.isArray(out.system) && out.system.length > 0) {
+    const i = out.system.length - 1;
+    const last = out.system[i] as { type: string; text?: string; cache_control?: unknown };
+    if (!last.cache_control) {
+      out.system = [...out.system.slice(0, i), { ...last, cache_control: { type: "ephemeral" } }];
+    }
+  }
+  const tools = (out as { tools?: Array<Record<string, unknown>> }).tools;
+  if (Array.isArray(tools) && tools.length > 0) {
+    const i = tools.length - 1;
+    const last = tools[i];
+    if (!last.cache_control) {
+      (out as { tools?: Array<Record<string, unknown>> }).tools = [
+        ...tools.slice(0, i),
+        { ...last, cache_control: { type: "ephemeral" } },
+      ];
+    }
   }
   return out;
 }
