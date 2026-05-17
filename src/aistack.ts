@@ -359,10 +359,14 @@ async function dispatchWithRectifier(
 
         if (!primary) {
           // Fall back to OAuth Sonnet, piping its stream through (it already
-          // speaks Anthropic SSE so no translation needed).
+          // speaks Anthropic SSE so no translation needed). KEEP heartbeats
+          // running during the fallback wait — Anthropic can take several
+          // seconds to send the first SSE byte and a silent socket gets
+          // dropped by Claude Code's fetch. SSE comment lines (heartbeats)
+          // interleaved with real events is valid and harmless to the parser.
           log("warn", "rectifier.fallback_to_oauth", { reason: primaryErr?.message ?? "unknown" });
-          waiting = false; // stop heartbeats once data starts flowing
           await pipeOauthFallback(req, sendStr);
+          // waiting flips false in the outer `finally` once the stream closes.
           resolveOutcome("stream_error");
           return;
         }
