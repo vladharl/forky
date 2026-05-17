@@ -133,8 +133,32 @@ tail -F ~/.forky/log/$(date +%F).jsonl          # live request log
 | `FORKY_CIRCUIT_THRESHOLD` | `3` | failures before circuit opens |
 | `FORKY_CIRCUIT_WINDOW_MS` | `60000` | sliding window for failures |
 | `FORKY_CIRCUIT_OPEN_MS` | `60000` | how long the circuit stays open |
+| `FORKY_FRESH_TURNS` | unset | when `on`, each request to the execution backend is trimmed to the most recent user prompt (and its tool chain). Avoids context overflow on long sessions; loses cross-prompt memory. |
+| `FORKY_REVIEW` | `on` | toggle for the optional `bin/forky-review-hook` PreToolUse hook |
 
 `AISTACK_*` env vars (`AISTACK_API_KEY`, `AISTACK_BASE_URL`, `AISTACK_MODEL`) are accepted as legacy aliases.
+
+### Optional: per-turn Opus review of Write/Edit changes
+
+`bin/forky-review-hook` is a PreToolUse hook that runs Opus on every Write/Edit
+over 50 lines to catch bugs/typos before they land. Skips tests, docs, lock files;
+uses prompt caching so the system block is shared across reviews. If Opus suggests
+fixes, the corrected `tool_input` is handed back to Claude Code via
+`hookSpecificOutput.updatedInput` and the original change never runs.
+
+Register in `~/.claude/settings.json`:
+```jsonc
+"hooks": {
+  "PreToolUse": [
+    {
+      "matcher": "Write|Edit",
+      "hooks": [{ "type": "command", "command": "/absolute/path/to/forky/bin/forky-review-hook" }]
+    }
+  ]
+}
+```
+
+Disable temporarily with `FORKY_REVIEW=off`. Audit log at `~/.forky/reviews.jsonl`.
 
 ## How it works
 

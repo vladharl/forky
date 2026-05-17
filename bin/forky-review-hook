@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# PreToolUse hook for Write|Edit: asks Opus (via forky's planning route) to
+# review the proposed change. If Opus suggests modifications, hands the
+# corrected tool_input back to Claude Code via hookSpecificOutput.updatedInput.
+#
+# Cost-aware: skips small edits (<50 lines), tests/docs/configs, and respects
+# FORKY_REVIEW=off to disable entirely. Uses prompt caching on the system
+# block so repeated reviews share most of their input tokens.
+#
+# Never blocks: any failure path returns {} (allow with no changes).
+
+set -uo pipefail
+
+PAYLOAD=$(cat)
+
+# Toggle
+if [ "${FORKY_REVIEW:-on}" != "on" ]; then echo '{}'; exit 0; fi
+
+TOOL_NAME=$(printf '%s' "$PAYLOAD" | jq -r '.tool_name // empty')
+case "$TOOL_NAME" in
+  Write|Edit) : ;;
+  *) echo '{}'; exit 0 ;;
+esac
+
+FILE_PATH=$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.file_path // empty')
+[ -z "$FILE_PATH" ] && { echo '{}'; exit 0; }
+
+# Path skips: tests, docs, lock files, package metadata
+case "$FILE_PATH" in
+  */tests/*|*/test/*|*/__tests__/*|*.test.*|*.spec.*) echo '{}'; exit 0 ;;
+  *.md|*.mdx|*.rst|*.txt) echo '{}'; exit 0 ;;
+  */package.json|*/package-lock.json|*/bun.lock|*/yarn.lock|*/Cargo.lock|*/poetry.lock|*/uv.lock|*.lock) echo '{}'; exit 0 ;;
+  *.gitignore|*.dockerignore|*.npmrc) echo '{}'; exit 0 ;;
+esac
+
+# Line-count gate (<50 lines = skip)
+LINES_CHANGED=0
+if [ "$TOOL_NAME" = "Write" ]; then
+  CONTENT=$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.content // empty')
+  LINES_CHANGED=$(printf '%s' "$CONTENT" | wc -l | tr -d ' ')
+else
+  OLD=$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.old_string // empty')
+  NEW=$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.new_string // empty')
+  LO=$(printf '%s' "$OLD" | wc -l | tr -d ' ')
+  LN=$(printf '%s' "$NEW" | wc -l | tr -d ' ')
+  LINES_CHANGED=$(( LO > LN ? LO : LN ))
+fi
+[ "$LINES_CHANGED" -lt 50 ] && { echo '{}'; exit 0; }
+
+# Build the review request
+SYS='You are a senior code reviewer. The user is about to apply a Write or Edit tool call. Review the proposed change against the current file and return ONLY a JSON object with this shape:
+
+{"verdict": "approve" | "modify", "reason": "<one line>", "corrected_input": <full corrected tool_input JSON, only if verdict is "modify">}
+
+Approve unless you see a CLEAR defect: a real bug, a security issue, an obvious typo in code that will fail compilation/lint, or a logic error contradicting the surrounding code. Do not modify for style, comments, naming, or preference. Do not add features. When in doubt, approve.
+
+If you do modify: preserve all fields of the original tool_input, including file_path. Only adjust the content/new_string/old_string. Keep the change minimal — fix the bug, nothing more.
+
+Reply with ONLY the JSON object. No markdown fences, no preamble.'
+
+CUR=""
+if [ -f "$FILE_PATH" ]; then
+  CUR=$(head -c 20000 "$FILE_PATH")
+fi
+
+USER_MSG=$(jq -n \
+  --arg tool "$TOOL_NAME" \
+  --arg path "$FILE_PATH" \
+  --argjson input "$(printf '%s' "$PAYLOAD" | jq '.tool_input')" \
+  --arg current "$CUR" \
+  '"Tool: \($tool)\nFile: \($path)\n\nCurrent file content (first 20KB, may be empty for new files):\n```\n\($current)\n```\n\nProposed tool_input:\n```json\n\($input | tojson)\n```"')
+
+REQ=$(jq -n \
+  --arg sys "$SYS" \
+  --argjson user_msg "$USER_MSG" \
+  '{
+    model: "claude-opus-4-7",
+    max_tokens: 4000,
+    system: [{type: "text", text: $sys, cache_control: {type: "ephemeral"}}],
+    messages: [{role: "user", content: $user_msg}]
+  }')
+
+# 60s budget — Opus review on a large file may be slow.
+RESP=$(printf '%s' "$REQ" | curl -s --max-time 60 -X POST http://127.0.0.1:3456/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  --data @-)
+
+# Always log (even on failures) for auditability
+LOG_DIR="$HOME/.forky"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/reviews.jsonl"
+{
+  jq -n \
+    --arg ts "$(date -u +%FT%TZ)" \
+    --arg path "$FILE_PATH" \
+    --arg tool "$TOOL_NAME" \
+    --argjson lines "$LINES_CHANGED" \
+    --arg opus "$(printf '%s' "$RESP" | jq -r '.content[0].text // "ERROR"' 2>/dev/null | head -c 1200)" \
+    --argjson usage "$(printf '%s' "$RESP" | jq '.usage // null' 2>/dev/null)" \
+    '{ts: $ts, file: $path, tool: $tool, lines_changed: $lines, opus_text: $opus, usage: $usage}' \
+    2>/dev/null || echo '{"ts":"'"$(date -u +%FT%TZ)"'","error":"log-build-failed"}'
+} >> "$LOG_FILE"
+
+OPUS_TEXT=$(printf '%s' "$RESP" | jq -r '.content[0].text // empty' 2>/dev/null)
+[ -z "$OPUS_TEXT" ] && { echo '{}'; exit 0; }
+
+# Parse with python (more lenient than jq on Opus's JSON)
+PARSED=$(printf '%s' "$OPUS_TEXT" | python3 - <<'PY' 2>/dev/null
+import sys, json, re
+text = sys.stdin.read()
+# strip markdown fences if any
+text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip(), flags=re.MULTILINE)
+m = re.search(r'\{.*\}', text, re.DOTALL)
+if not m:
+    sys.exit(1)
+try:
+    parsed = json.loads(m.group(0))
+except Exception:
+    sys.exit(1)
+verdict = parsed.get('verdict', 'approve')
+if verdict == 'modify' and 'corrected_input' in parsed:
+    print(json.dumps({"verdict": "modify", "corrected_input": parsed['corrected_input'], "reason": parsed.get('reason', '')}))
+else:
+    print(json.dumps({"verdict": "approve", "reason": parsed.get('reason', '')}))
+PY
+)
+
+[ -z "$PARSED" ] && { echo '{}'; exit 0; }
+
+VERDICT=$(printf '%s' "$PARSED" | jq -r '.verdict')
+if [ "$VERDICT" = "modify" ]; then
+  CORRECTED=$(printf '%s' "$PARSED" | jq '.corrected_input')
+  REASON=$(printf '%s' "$PARSED" | jq -r '.reason')
+  jq -n \
+    --argjson ci "$CORRECTED" \
+    --arg reason "$REASON" \
+    '{
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "allow",
+        permissionDecisionReason: ("forky-review (Opus): " + $reason),
+        updatedInput: $ci
+      },
+      systemMessage: ("forky-review modified the " + ($ci.file_path // "file") + " — " + $reason)
+    }'
+  exit 0
+fi
+
+echo '{}'
+exit 0

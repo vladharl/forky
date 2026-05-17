@@ -58,8 +58,34 @@ const DEFAULT_TOOL_NUDGE =
 
 const TOOL_NUDGE = process.env.EXEC_TOOL_FORMAT_NUDGE ?? DEFAULT_TOOL_NUDGE;
 
+// When FORKY_FRESH_TURNS=on, trim the conversation back to the most recent
+// user prompt (preserving any tool_use / tool_result pairs that belong to it).
+// Each user prompt becomes its own self-contained agent invocation — no
+// cross-prompt memory. Useful when the execution model's context window is
+// small relative to the session length, and you'd rather lose continuity than
+// hit context overflow.
+function trimToCurrentTurn(messages: AnthropicRequest["messages"]): AnthropicRequest["messages"] {
+  if (process.env.FORKY_FRESH_TURNS !== "on") return messages;
+  // Find the latest user message that's a fresh prompt (not purely a tool_result).
+  let startIdx = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "user") continue;
+    const content = m.content;
+    const isPureToolResult = Array.isArray(content) && content.length > 0
+      && content.every((b) => typeof b === "object" && b !== null
+        && (b as { type: string }).type === "tool_result");
+    if (!isPureToolResult) {
+      startIdx = i;
+      break;
+    }
+  }
+  return messages.slice(startIdx);
+}
+
 export function translateRequest(req: AnthropicRequest, opts: TranslateOptions): AiStackRequest {
   const messages: OpenAiMessage[] = [];
+  const turnMessages = trimToCurrentTurn(req.messages);
 
   // System prompt: flatten string-or-array form into one OpenAI system message,
   // then append the tool-format override so it has maximum recency.
@@ -73,7 +99,7 @@ export function translateRequest(req: AnthropicRequest, opts: TranslateOptions):
     messages.push({ role: "system", content: TOOL_NUDGE.trim() });
   }
 
-  for (const msg of req.messages) {
+  for (const msg of turnMessages) {
     if (typeof msg.content === "string") {
       messages.push({ role: msg.role, content: msg.content });
       continue;
