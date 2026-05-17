@@ -60,27 +60,54 @@ const TOOL_NUDGE = process.env.EXEC_TOOL_FORMAT_NUDGE ?? DEFAULT_TOOL_NUDGE;
 
 // When FORKY_FRESH_TURNS=on, trim the conversation back to the most recent
 // user prompt (preserving any tool_use / tool_result pairs that belong to it).
-// Each user prompt becomes its own self-contained agent invocation — no
-// cross-prompt memory. Useful when the execution model's context window is
-// small relative to the session length, and you'd rather lose continuity than
-// hit context overflow.
+// FORKY_MAX_MESSAGES applies a hard cap on top of that: even within a single
+// user turn, very long tool chains can balloon the context to 50K+ tokens,
+// which pushes weaker primaries past their timeout. The cap trims the OLDEST
+// messages within the current turn, but always lands on a fresh-user-prompt
+// boundary so the Anthropic API's tool_use/tool_result pairing isn't broken.
+const MAX_MESSAGES = Number(process.env.FORKY_MAX_MESSAGES ?? 0);
+
+function isPureToolResultMessage(m: { role: string; content: unknown }): boolean {
+  if (m.role !== "user") return false;
+  const content = m.content;
+  return Array.isArray(content) && content.length > 0
+    && content.every((b) => typeof b === "object" && b !== null
+      && (b as { type: string }).type === "tool_result");
+}
+
 function trimToCurrentTurn(messages: AnthropicRequest["messages"]): AnthropicRequest["messages"] {
   if (process.env.FORKY_FRESH_TURNS !== "on") return messages;
-  // Find the latest user message that's a fresh prompt (not purely a tool_result).
+
+  // Step 1: trim to latest user prompt onward.
   let startIdx = 0;
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m.role !== "user") continue;
-    const content = m.content;
-    const isPureToolResult = Array.isArray(content) && content.length > 0
-      && content.every((b) => typeof b === "object" && b !== null
-        && (b as { type: string }).type === "tool_result");
-    if (!isPureToolResult) {
+    if (!isPureToolResultMessage(m)) {
       startIdx = i;
       break;
     }
   }
-  return messages.slice(startIdx);
+  let trimmed = messages.slice(startIdx);
+
+  // Step 2: hard cap on total message count, sliding from the end. Walk forward
+  // from the cap point until we hit a user message that's a fresh prompt
+  // (not a continuation tool_result) — that's a safe slice boundary.
+  if (MAX_MESSAGES > 0 && trimmed.length > MAX_MESSAGES) {
+    let capStart = trimmed.length - MAX_MESSAGES;
+    while (capStart < trimmed.length) {
+      const m = trimmed[capStart];
+      if (m.role === "user" && !isPureToolResultMessage(m)) break;
+      capStart++;
+    }
+    if (capStart < trimmed.length) {
+      trimmed = trimmed.slice(capStart);
+    }
+    // If no clean slice point exists in the last MAX_MESSAGES, fall through
+    // with the unsliced (step-1) trim — Anthropic API needs a valid shape.
+  }
+
+  return trimmed;
 }
 
 export function translateRequest(req: AnthropicRequest, opts: TranslateOptions): AiStackRequest {

@@ -12,7 +12,7 @@ import { log } from "./log.ts";
 // Bound on how long the rectifier path will wait for the primary model before
 // giving up and falling back to OAuth Sonnet. Configurable via env so the user
 // can dial it for their backend's typical latency.
-const REFORMAT_PRIMARY_TIMEOUT_MS = Number(process.env.FORKY_REFORMAT_PRIMARY_TIMEOUT_MS ?? 30_000);
+const REFORMAT_PRIMARY_TIMEOUT_MS = Number(process.env.FORKY_REFORMAT_PRIMARY_TIMEOUT_MS ?? 60_000);
 const REFORMAT_RECTIFIER_TIMEOUT_MS = Number(process.env.FORKY_REFORMAT_RECTIFIER_TIMEOUT_MS ?? 20_000);
 // SSE comment heartbeat interval — keeps Claude Code's socket from being closed
 // by intermediate proxies / OS timeouts while we're waiting on the primary.
@@ -267,6 +267,15 @@ async function dispatchWithRectifier(
   externalSignal?: AbortSignal,
 ): Promise<StreamingResult> {
   const translated = translateRequest(req, { stream: false });
+  // Quick size telemetry — helps spot context bloat that pushes the primary
+  // past its timeout. ~4 chars per token is the rough rule of thumb.
+  const bodyChars = JSON.stringify(translated).length;
+  log("info", "rectifier.size", {
+    bodyChars,
+    estTokens: Math.round(bodyChars / 4),
+    messageCount: translated.messages.length,
+    toolCount: translated.tools?.length ?? 0,
+  });
 
   // Always return 200 + a stream. All upstream work happens inside the stream's
   // start() so we can emit SSE keep-alive heartbeats while waiting on the
