@@ -47,6 +47,17 @@ else
 fi
 [ "$LINES_CHANGED" -lt 50 ] && { echo '{}'; exit 0; }
 
+# Whitespace-only diff skip (Edit only). If old_string and new_string differ
+# only in whitespace, the change is a reformat — not worth Opus tokens to
+# review. Compare with all whitespace collapsed.
+if [ "$TOOL_NAME" = "Edit" ]; then
+  OLD_NOWS=$(printf '%s' "${OLD:-}" | tr -d '[:space:]')
+  NEW_NOWS=$(printf '%s' "${NEW:-}" | tr -d '[:space:]')
+  if [ "$OLD_NOWS" = "$NEW_NOWS" ]; then
+    echo '{}'; exit 0
+  fi
+fi
+
 # Build the review request
 SYS='You are a senior code reviewer. The user is about to apply a Write or Edit tool call. Review the proposed change against the current file and return ONLY a JSON object with this shape:
 

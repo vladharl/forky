@@ -79,4 +79,18 @@ export class Circuit {
       nextProbeAt: this.openedAt != null ? this.openedAt + this.opts.openMs : null,
     };
   }
+
+  /**
+   * Restore from a persisted snapshot. Only OPEN states from within the
+   * current openMs window are restored (a forky restart shouldn't honour
+   * a half-day-old "open" state). Returns true if circuit was restored to OPEN.
+   */
+  restore(snap: CircuitSnapshot | null | undefined): boolean {
+    if (!snap || snap.state !== "open" || snap.openedAt == null) return false;
+    const elapsed = this.opts.now() - snap.openedAt;
+    if (elapsed >= this.opts.openMs) return false;
+    this.state = "open";
+    this.openedAt = snap.openedAt;
+    return true;
+  }
 }

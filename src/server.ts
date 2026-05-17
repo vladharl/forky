@@ -4,7 +4,7 @@ import { dispatchAiStackNonStreaming, dispatchAiStackStreaming, getAiStackEnv, g
 import { AnthropicRequest } from "./schemas.ts";
 import { decideRoute } from "./route.ts";
 import { Circuit } from "./resilience/circuit.ts";
-import { setPort, incRequests, incAiStackFailure, incFallback, updateCircuit } from "./resilience/status.ts";
+import { setPort, incRequests, incAiStackFailure, incFallback, updateCircuit, getPersistedSnapshot } from "./resilience/status.ts";
 import { log } from "./log.ts";
 
 // Dev port: 3456 = dario, 3457 = dario-bridge zombie. Cutover moves to 3456 later.
@@ -28,6 +28,15 @@ const circuit = new Circuit({
   windowMs: Number(process.env.FORKY_CIRCUIT_WINDOW_MS ?? 60_000),
   openMs: Number(process.env.FORKY_CIRCUIT_OPEN_MS ?? 60_000),
 });
+// Restore circuit from disk if the previous instance was OPEN within the
+// current openMs window — otherwise a restart would silently reset to CLOSED
+// and let a known-bad upstream get hammered immediately again.
+{
+  const persisted = getPersistedSnapshot();
+  if (persisted?.circuit && circuit.restore(persisted.circuit)) {
+    log("info", "circuit.restored_from_disk", { openedAt: persisted.circuit.openedAt });
+  }
+}
 const syncCircuit = () => updateCircuit(circuit.snapshot());
 
 const app = new Hono();
