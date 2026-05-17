@@ -1,7 +1,7 @@
 {
   "name": "forky",
   "version": "0.1.0",
-  "description": "Local proxy splitting Claude Code: OAuth Opus for planning, any OpenAI-compatible endpoint for execution",
+  "description": "Local proxy that splits Claude Code traffic — OAuth Opus for plan mode, any OpenAI-compatible endpoint for execution. Includes 2-model XML-rectifier chain, Opus PreToolUse reviewer, prompt caching, circuit breaker with cross-restart persistence, per-provider concurrency limiter with 429 retry, and SSE keep-alive heartbeats. macOS + Linux.",
   "repository": { "type": "git", "url": "https://github.com/vladharl/forky.git" },
   "license": "MIT",
   "author": "Vlad Harlamov",
