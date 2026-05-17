@@ -125,6 +125,7 @@ tail -F ~/.forky/log/$(date +%F).jsonl          # live request log
 | `EXEC_API_KEY` | — | **required** — bearer for your OpenAI-compatible endpoint |
 | `EXEC_BASE_URL` | — | **required** — e.g. `https://api.together.xyz/v1` |
 | `EXEC_MODEL` | `qwen-35b` | model name sent to the execution backend |
+| `EXEC_REFORMAT_MODEL` | — | optional: name of a second model used to rectify the primary's tool calls. When set, forky calls `EXEC_MODEL` non-streaming, and if the response looks like XML tool emissions, calls this model with the same tool definitions to convert them into proper `tool_calls`. Useful when your strongest model (qwen-35b) mimics Claude's XML format but a smaller model (gemma-micro) is reliable at OpenAI function-calling. |
 | `PORT` | `3458` | listening port (set to `3456` for production) |
 | `HOST` | `127.0.0.1` | bind address — keep loopback |
 | `FORKY_FIRST_BYTE_MS` | `30000` | stream watchdog: first-byte timeout |
@@ -141,6 +142,7 @@ tail -F ~/.forky/log/$(date +%F).jsonl          # live request log
 - **Execution path**: every request gets translated from Anthropic Messages API → OpenAI Chat Completions (system blocks flattened, tools mapped, image blocks → `image_url`). `tools_enabled: false` is hard-pinned to prevent server-side tool loops on backends that expose them (e.g. native web search).
 - **Stream translation**: OpenAI delta chunks → Anthropic event stream (`message_start` → `content_block_*` → `message_delta` → `message_stop`), with partial-JSON accumulation for streaming tool calls. `delta.reasoning_content` is dropped (most Claude Code UIs don't render it).
 - **Never-stuck guarantee**: a stream watchdog fires `WatchdogTimeoutError` on first-byte / inter-chunk gap, the circuit breaker reroutes to OAuth Sonnet after N consecutive failures, and every code path emits a terminal `message_stop` event in a `finally` block so Claude Code can never wait forever.
+- **Two-model rectifier (optional)**: with `EXEC_REFORMAT_MODEL` set, forky runs a `primary → reformatter` chain on the execution path. The primary (e.g. `qwen-35b`) does the reasoning; if it emits tool calls as XML (a common failure mode for models trained on Claude-style data), forky asks the reformatter (e.g. `gemma-micro`) to extract them as structured `tool_calls`. Sacrifices token-level streaming for end-to-end tool execution.
 
 ## Tests
 
