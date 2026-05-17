@@ -3,6 +3,8 @@ import { translateRequest } from "./translate/request.ts";
 import { translateResponse } from "./translate/response.ts";
 import { SseTranslator, readSseStream, sseEvent } from "./translate/sse.ts";
 import { withWatchdog, WatchdogTimeoutError } from "./resilience/watchdog.ts";
+import { Semaphore, withSemaphore } from "./resilience/semaphore.ts";
+import { fetchWithRetryOn429 } from "./resilience/retry.ts";
 import { looksLikeXmlToolCall, rectifyToolCalls } from "./translate/reformat.ts";
 import { forwardOAuthAsFallback, type AnthropicBody } from "./anthropic.ts";
 import { log } from "./log.ts";
@@ -15,6 +17,28 @@ const REFORMAT_RECTIFIER_TIMEOUT_MS = Number(process.env.FORKY_REFORMAT_RECTIFIE
 // SSE comment heartbeat interval — keeps Claude Code's socket from being closed
 // by intermediate proxies / OS timeouts while we're waiting on the primary.
 const HEARTBEAT_MS = Number(process.env.FORKY_HEARTBEAT_MS ?? 5_000);
+
+// Concurrency limiter for outbound execution-backend calls. AI Stack's qwen
+// services cap at 4 concurrent; bursts beyond that 429. Forky queues here so
+// AI Stack never sees a burst. Configurable via env.
+const EXEC_MAX_CONCURRENT = Number(process.env.FORKY_EXEC_MAX_CONCURRENT ?? 4);
+const EXEC_429_ATTEMPTS = Number(process.env.FORKY_EXEC_429_ATTEMPTS ?? 3);
+const EXEC_429_BASE_DELAY_MS = Number(process.env.FORKY_EXEC_429_BASE_DELAY_MS ?? 250);
+export const execSemaphore = new Semaphore(EXEC_MAX_CONCURRENT);
+
+/**
+ * fetch() through the execution-backend semaphore, with 429 retry+backoff.
+ * Use this for every outbound call to the EXEC_BASE_URL (primary + rectifier).
+ */
+export async function execFetch(url: string, init: RequestInit, label: string): Promise<Response> {
+  return withSemaphore(execSemaphore, () =>
+    fetchWithRetryOn429(url, init, {
+      maxAttempts: EXEC_429_ATTEMPTS,
+      baseDelayMs: EXEC_429_BASE_DELAY_MS,
+      label,
+    }),
+  );
+}
 
 function getReformatModel(): string | null {
   return process.env.EXEC_REFORMAT_MODEL ?? process.env.AISTACK_REFORMAT_MODEL ?? null;
@@ -50,7 +74,7 @@ export async function dispatchAiStackNonStreaming(
 
   let upstream: Response;
   try {
-    upstream = await fetch(`${env.baseUrl}/chat/completions`, {
+    upstream = await execFetch(`${env.baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -59,7 +83,7 @@ export async function dispatchAiStackNonStreaming(
       },
       body: JSON.stringify(translated),
       signal,
-    });
+    }, "aistack.nonstream");
   } catch (e) {
     log("error", "aistack.fetch_failed", { err: (e as Error).message });
     return {
@@ -142,7 +166,7 @@ export async function dispatchAiStackStreaming(
 
   let upstream: Response;
   try {
-    upstream = await fetch(`${env.baseUrl}/chat/completions`, {
+    upstream = await execFetch(`${env.baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -151,7 +175,7 @@ export async function dispatchAiStackStreaming(
       },
       body: JSON.stringify(translated),
       signal: abort.signal,
-    });
+    }, "aistack.stream");
   } catch (e) {
     clearTimeout(firstByteTimer);
     log("error", "aistack.fetch_failed", { err: (e as Error).message });
@@ -272,7 +296,7 @@ async function dispatchWithRectifier(
         let primary: ReturnType<typeof AiStackResponse.parse> | null = null;
         let primaryErr: Error | null = null;
         try {
-          const upstream = await fetch(`${env.baseUrl}/chat/completions`, {
+          const upstream = await execFetch(`${env.baseUrl}/chat/completions`, {
             method: "POST",
             headers: {
               "content-type": "application/json",
@@ -281,7 +305,7 @@ async function dispatchWithRectifier(
             },
             body: JSON.stringify(translated),
             signal: primarySignal,
-          });
+          }, "aistack.rectifier.primary");
           if (!upstream.ok) {
             const text = await upstream.text().catch(() => "");
             log("error", "aistack.upstream_error", { status: upstream.status, path: "rectifier", body: text.slice(0, 300) });

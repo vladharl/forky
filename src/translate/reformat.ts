@@ -1,4 +1,4 @@
-import type { AiStackEnv } from "../aistack.ts";
+import { type AiStackEnv, execFetch } from "../aistack.ts";
 import { log } from "../log.ts";
 
 type OpenAiTool = {
@@ -64,7 +64,7 @@ export async function rectifyToolCalls(
 
   let res: Response;
   try {
-    res = await fetch(`${env.baseUrl}/chat/completions`, {
+    res = await execFetch(`${env.baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -72,7 +72,7 @@ export async function rectifyToolCalls(
       },
       body: JSON.stringify(body),
       signal,
-    });
+    }, "aistack.rectifier.gemma");
   } catch (e) {
     log("error", "reformat.fetch_failed", { err: (e as Error).message });
     return { content: rawContent, tool_calls: null };

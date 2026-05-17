@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { forwardOAuth, forwardOAuthAsFallback, type AnthropicBody } from "./anthropic.ts";
-import { dispatchAiStackNonStreaming, dispatchAiStackStreaming, getAiStackEnv, type AiStackEnv } from "./aistack.ts";
+import { dispatchAiStackNonStreaming, dispatchAiStackStreaming, getAiStackEnv, execSemaphore, type AiStackEnv } from "./aistack.ts";
 import { AnthropicRequest } from "./schemas.ts";
 import { decideRoute } from "./route.ts";
 import { Circuit } from "./resilience/circuit.ts";
@@ -38,6 +38,7 @@ app.get("/health", (c) => c.json({
   providers: { anthropic_oauth: true, aistack: aiStackEnv != null },
   circuit: circuit.snapshot(),
   watchdog: WATCHDOG,
+  execSemaphore: execSemaphore.snapshot(),
 }));
 
 app.post("/v1/messages", async (c) => {
