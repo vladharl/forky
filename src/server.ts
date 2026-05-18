@@ -114,6 +114,57 @@ app.post("/v1/messages", async (c) => {
 
   // ─── Anthropic OAuth path (planning, or fallback) ───
   if (actualProvider === "anthropic-oauth") {
+    // For STREAMING requests, return an SSE stream that pumps keep-alive
+    // comments while we await the fetch — Anthropic can take 30+ seconds to
+    // send headers under load, and silent sockets get dropped by Claude
+    // Code's fetch. For non-streaming requests, pass through directly (the
+    // client expects a single JSON body, not SSE).
+    if (isStream) {
+      const enc = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          let active = true;
+          const heartbeat = setInterval(() => {
+            if (active) { try { controller.enqueue(enc.encode(": forky-keepalive\n\n")); } catch {} }
+          }, 5000);
+          try {
+            const upstream = fellBack
+              ? await forwardOAuthAsFallback(routedBody as AnthropicBody, undefined, undefined, clientHeaders)
+              : await forwardOAuth(routedBody as AnthropicBody, undefined, clientHeaders);
+            log("info", "response", { provider: actualProvider, status: upstream.status, ms: Date.now() - startedAt });
+            if (!upstream.body) { active = false; clearInterval(heartbeat); controller.close(); return; }
+            const reader = upstream.body.getReader();
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              if (value) { active = false; controller.enqueue(value); }
+            }
+          } catch (e) {
+            log("error", "anthropic.fetch_failed", { err: (e as Error).message });
+            try {
+              controller.enqueue(enc.encode(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_mux_err\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"" + model + "\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n"
+                + "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+                + "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"[forky: OAuth upstream failed: " + (e as Error).message.replace(/"/g, "'") + "]\"}}\n\n"
+                + "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+                + "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n"
+                + "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+              ));
+            } catch {}
+          } finally {
+            active = false;
+            clearInterval(heartbeat);
+            try { controller.close(); } catch {}
+          }
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "connection": "keep-alive" },
+      });
+    }
+
+    // Non-streaming OAuth pass-through.
     let upstream: Response;
     try {
       upstream = fellBack
