@@ -248,7 +248,17 @@ app.post("/v1/messages", async (c) => {
   return c.json(outBody, status as 200);
 });
 
-const server = Bun.serve({ port: PORT, hostname: HOST, fetch: app.fetch });
+// Bun.serve's idleTimeout defaults to 10s, which kills long-running streaming
+// responses (plan-mode turns regularly run 30s+; auto-mode tool chains longer).
+// 255 is the maximum allowed value in Bun (~4min); enough for any single turn.
+// Heartbeats keep the data flowing for the client; idleTimeout protects forky
+// from genuinely abandoned connections.
+const server = Bun.serve({
+  port: PORT,
+  hostname: HOST,
+  fetch: app.fetch,
+  idleTimeout: 255,
+});
 setPort(server.port);
 syncCircuit();
 log("info", "server.start", { host: server.hostname, port: server.port, watchdog: WATCHDOG });
