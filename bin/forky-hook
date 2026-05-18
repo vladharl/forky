@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
-# Claude Code UserPromptSubmit hook: toggles forky's Opus sentinel based on
-# the session's permission_mode. Plan mode → Opus on, anything else → off.
+# Claude Code hook: toggles forky's Opus sentinel based on permission mode.
+# Handles two events:
+#   - UserPromptSubmit: sets sentinel when permission_mode is "plan", clears
+#     it (session-aware) when it's anything else.
+#   - PostToolUse on ExitPlanMode: clears the sentinel when the user accepts
+#     a plan, since Claude Code transitions to implementation without a new
+#     UserPromptSubmit firing.
 #
 # Session-aware: the sentinel records which session_id set it. A different
 # session leaving plan mode WILL NOT clear someone else's active sentinel
 # (avoids cross-session interference when you have multiple Claude Code
 # panels open against the same forky proxy).
 #
-# Wired into ~/.claude/settings.json under hooks.UserPromptSubmit. Must
-# always exit 0 quickly — anything else blocks the prompt submission.
+# Wired into ~/.claude/settings.json:
+#   hooks.UserPromptSubmit       → no matcher
+#   hooks.PostToolUse            → matcher: "ExitPlanMode"
+#
+# Must always exit 0 quickly — anything else blocks the prompt/tool.
 
 FLAG="$HOME/.forky/opus"
 LOG="$HOME/.forky/hook.log"
@@ -16,46 +24,69 @@ mkdir -p "$(dirname "$FLAG")"
 
 PAYLOAD=$(cat)
 
-# Always log the most recent payload for debugging; bounded to 200 lines.
 { echo "[$(date -u +%FT%TZ)] $PAYLOAD"; } >> "$LOG" 2>/dev/null
 if [ -f "$LOG" ]; then
   tail -200 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
 fi
 
-# Extract mode + session_id from the payload (both shapes Claude Code has used).
-read -r MODE SESSION <<< "$(printf '%s' "$PAYLOAD" | python3 -c "
+# Extract event, mode, session_id, tool_name from the payload (one python invocation).
+read -r EVENT MODE SESSION TOOL <<< "$(printf '%s' "$PAYLOAD" | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
+    evt = d.get('hook_event_name') or d.get('hookEventName') or ''
     mode = d.get('permission_mode') or d.get('permissionMode') or ''
     sid = d.get('session_id') or d.get('sessionId') or ''
-    print(f'{mode} {sid}')
+    tool = d.get('tool_name') or d.get('toolName') or ''
+    print(f'{evt or \"_\"} {mode or \"_\"} {sid or \"_\"} {tool or \"_\"}')
 except Exception:
-    print(' ')
+    print('_ _ _ _')
 " 2>/dev/null)"
 
-if [ "$MODE" = "plan" ]; then
-  # Record this session as the owner of the active sentinel.
-  printf '{"session_id":%s,"set_at":%s}\n' "$(printf '%s' "${SESSION:-unknown}" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))')" "$(date +%s)" > "$FLAG"
-else
-  # Only clear if THIS session owns the sentinel — avoids killing another
-  # session's plan-mode routing.
-  if [ -f "$FLAG" ]; then
-    OWNER=$(python3 -c "
+clear_sentinel_if_owned() {
+  [ -f "$FLAG" ] || return 0
+  OWNER=$(python3 -c "
 import json, sys
 try:
     with open('$FLAG') as f:
         d = json.load(f)
     print(d.get('session_id') or '')
 except Exception:
-    # legacy empty-file sentinels (pre-session-aware) have no owner — treat
-    # as ours so old behavior of 'any session clears' is preserved on upgrade.
     print('$SESSION')
 " 2>/dev/null)
-    if [ -z "$OWNER" ] || [ "$OWNER" = "$SESSION" ] || [ "$OWNER" = "unknown" ]; then
-      rm -f "$FLAG"
-    fi
+  if [ -z "$OWNER" ] || [ "$OWNER" = "$SESSION" ] || [ "$OWNER" = "unknown" ]; then
+    rm -f "$FLAG"
   fi
-fi
+}
+
+set_sentinel_for_session() {
+  local sid="${SESSION:-unknown}"
+  printf '{"session_id":%s,"set_at":%s}\n' \
+    "$(printf '%s' "$sid" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))')" \
+    "$(date +%s)" > "$FLAG"
+}
+
+case "$EVENT" in
+  UserPromptSubmit)
+    if [ "$MODE" = "plan" ]; then
+      set_sentinel_for_session
+    else
+      clear_sentinel_if_owned
+    fi
+    ;;
+
+  PostToolUse)
+    # ExitPlanMode = the user accepted a plan and Claude Code is moving into
+    # implementation. Clear the sentinel so execution traffic stops routing
+    # to OAuth Opus.
+    if [ "$TOOL" = "ExitPlanMode" ]; then
+      clear_sentinel_if_owned
+    fi
+    ;;
+
+  *)
+    # Unknown / unhandled event — be a no-op rather than blocking.
+    ;;
+esac
 
 exit 0
