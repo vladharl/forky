@@ -68,7 +68,9 @@ export function decideRoute(
   return { provider: "aistack", reason: "execution" };
 }
 
-// Kept for backward compatibility.
+// Kept for backward compatibility. The classifier heuristic relies on the
+// body's tools field, which a model-name-only caller doesn't have; assume
+// main-agent context (tools present) so this returns the original answer.
 export function pickProvider(model: string): Provider {
-  return decideRoute(model).provider;
+  return decideRoute(model, { tools: [{ name: "_main_agent_stub" }] }).provider;
 }
