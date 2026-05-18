@@ -2,8 +2,13 @@
 # Claude Code UserPromptSubmit hook: toggles forky's Opus sentinel based on
 # the session's permission_mode. Plan mode → Opus on, anything else → off.
 #
-# Wired into ~/.claude/settings.json under hooks.UserPromptSubmit. Must always
-# exit 0 quickly — anything else blocks the prompt submission.
+# Session-aware: the sentinel records which session_id set it. A different
+# session leaving plan mode WILL NOT clear someone else's active sentinel
+# (avoids cross-session interference when you have multiple Claude Code
+# panels open against the same forky proxy).
+#
+# Wired into ~/.claude/settings.json under hooks.UserPromptSubmit. Must
+# always exit 0 quickly — anything else blocks the prompt submission.
 
 FLAG="$HOME/.forky/opus"
 LOG="$HOME/.forky/hook.log"
@@ -11,28 +16,46 @@ mkdir -p "$(dirname "$FLAG")"
 
 PAYLOAD=$(cat)
 
-# Always log the most recent payload (small) for debugging; truncate to 1 line.
-{
-  echo "[$(date -u +%FT%TZ)] $PAYLOAD"
-} >> "$LOG" 2>/dev/null
-# Keep log bounded to last 200 lines.
+# Always log the most recent payload for debugging; bounded to 200 lines.
+{ echo "[$(date -u +%FT%TZ)] $PAYLOAD"; } >> "$LOG" 2>/dev/null
 if [ -f "$LOG" ]; then
   tail -200 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
 fi
 
-MODE=$(printf '%s' "$PAYLOAD" | python3 -c "
+# Extract mode + session_id from the payload (both shapes Claude Code has used).
+read -r MODE SESSION <<< "$(printf '%s' "$PAYLOAD" | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
-    print(d.get('permission_mode') or d.get('permissionMode') or '')
+    mode = d.get('permission_mode') or d.get('permissionMode') or ''
+    sid = d.get('session_id') or d.get('sessionId') or ''
+    print(f'{mode} {sid}')
 except Exception:
-    print('')
-" 2>/dev/null)
+    print(' ')
+" 2>/dev/null)"
 
 if [ "$MODE" = "plan" ]; then
-  touch "$FLAG"
+  # Record this session as the owner of the active sentinel.
+  printf '{"session_id":%s,"set_at":%s}\n' "$(printf '%s' "${SESSION:-unknown}" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))')" "$(date +%s)" > "$FLAG"
 else
-  rm -f "$FLAG"
+  # Only clear if THIS session owns the sentinel — avoids killing another
+  # session's plan-mode routing.
+  if [ -f "$FLAG" ]; then
+    OWNER=$(python3 -c "
+import json, sys
+try:
+    with open('$FLAG') as f:
+        d = json.load(f)
+    print(d.get('session_id') or '')
+except Exception:
+    # legacy empty-file sentinels (pre-session-aware) have no owner — treat
+    # as ours so old behavior of 'any session clears' is preserved on upgrade.
+    print('$SESSION')
+" 2>/dev/null)
+    if [ -z "$OWNER" ] || [ "$OWNER" = "$SESSION" ] || [ "$OWNER" = "unknown" ]; then
+      rm -f "$FLAG"
+    fi
+  fi
 fi
 
 exit 0
