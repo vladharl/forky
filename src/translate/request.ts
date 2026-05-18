@@ -110,9 +110,73 @@ function trimToCurrentTurn(messages: AnthropicRequest["messages"]): AnthropicReq
   return trimmed;
 }
 
+// Replace tool_result blocks the model has already consumed (i.e., there's a
+// subsequent assistant message) with one-line placeholders. Big Read/Bash
+// outputs often dominate context — past tool results aren't usually re-read,
+// only their existence + identity matters for the model's planning. Keeps the
+// most recent tool_result block(s) full (those haven't been "consumed" yet).
+function truncateConsumedToolResults(messages: AnthropicRequest["messages"]): AnthropicRequest["messages"] {
+  // Read env at call time so tests / live config changes take effect without restart.
+  if (process.env.FORKY_TRUNCATE_TOOL_RESULTS === "off") return messages;
+  const minBytes = Number(process.env.FORKY_TRUNCATE_MIN_BYTES ?? 500);
+
+  // Build tool_use_id → { name, key arg preview } so placeholders carry context.
+  const toolInfo = new Map<string, { name: string; argHint: string }>();
+  for (const m of messages) {
+    if (m.role !== "assistant" || typeof m.content === "string") continue;
+    for (const b of m.content) {
+      if (b.type !== "tool_use") continue;
+      const input = (b as { input?: unknown }).input ?? {};
+      let argHint = "";
+      if (input && typeof input === "object") {
+        const keys = Object.keys(input as object);
+        if (keys.length > 0) {
+          const v = String((input as Record<string, unknown>)[keys[0]]).slice(0, 60);
+          argHint = `${keys[0]}=${v}`;
+        }
+      }
+      toolInfo.set((b as { id: string }).id, { name: (b as { name: string }).name, argHint });
+    }
+  }
+
+  // Identify the LAST user message containing tool_result — that one is fresh,
+  // don't truncate.
+  let lastToolResultIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "user" && Array.isArray(m.content)
+      && m.content.some((b) => (b as { type?: string }).type === "tool_result")) {
+      lastToolResultIdx = i;
+      break;
+    }
+  }
+
+  return messages.map((msg, i) => {
+    if (msg.role !== "user" || typeof msg.content === "string") return msg;
+    if (i === lastToolResultIdx) return msg; // keep most recent tool_result intact
+    const newContent = msg.content.map((block) => {
+      if ((block as { type?: string }).type !== "tool_result") return block;
+      const tr = block as { type: "tool_result"; tool_use_id: string; content?: unknown; is_error?: boolean };
+      const origLen = typeof tr.content === "string"
+        ? tr.content.length
+        : Array.isArray(tr.content)
+          ? tr.content.reduce((s, b) => s + ((b as { text?: string }).text?.length ?? 0), 0)
+          : 0;
+      if (origLen < minBytes) return block;
+      const info = toolInfo.get(tr.tool_use_id);
+      const label = info
+        ? `${info.name}${info.argHint ? `(${info.argHint})` : ""}`
+        : "tool";
+      const placeholder = `[${label} → ${origLen} chars, consumed by a later turn]`;
+      return { ...tr, content: placeholder };
+    });
+    return { ...msg, content: newContent };
+  });
+}
+
 export function translateRequest(req: AnthropicRequest, opts: TranslateOptions): AiStackRequest {
   const messages: OpenAiMessage[] = [];
-  const turnMessages = trimToCurrentTurn(req.messages);
+  const turnMessages = truncateConsumedToolResults(trimToCurrentTurn(req.messages));
 
   // System prompt: flatten string-or-array form into one OpenAI system message,
   // then append the tool-format override so it has maximum recency.

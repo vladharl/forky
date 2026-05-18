@@ -150,6 +150,10 @@ curl -s http://127.0.0.1:3456/health | jq .     # JSON health summary
 | `HOST` | `127.0.0.1` | bind address — keep loopback |
 | `FORKY_FRESH_TURNS` | unset | when `on`, each request is trimmed to the latest user prompt + its tool chain |
 | `FORKY_MAX_MESSAGES` | `0` (unlimited) | hard cap on messages per request (e.g. `20`) |
+| `FORKY_TRUNCATE_TOOL_RESULTS` | `on` | replace already-consumed tool_result bodies with one-line placeholders (preserves decision trail, drops bulk Read/Bash outputs); set `off` to disable |
+| `FORKY_TRUNCATE_MIN_BYTES` | `500` | min size of a tool_result body before truncation kicks in |
+| `FORKY_SUMMARIZE_THRESHOLD` | `0` (off) | when messages-per-request exceeds this, fold the older half into a single summary system block via `FORKY_SUMMARIZER_MODEL` |
+| `FORKY_SUMMARIZER_MODEL` | `gemma-micro` | model used by the optional summarizer pass |
 | `FORKY_REVIEW` | `on` | toggle for the optional `bin/forky-review-hook` PreToolUse hook |
 | `FORKY_CREDENTIALS_FILE` | `~/.claude/.credentials.json` | Linux only — override the OAuth credentials path |
 

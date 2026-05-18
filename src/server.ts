@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { forwardOAuth, forwardOAuthAsFallback, type AnthropicBody } from "./anthropic.ts";
 import { dispatchAiStackNonStreaming, dispatchAiStackStreaming, getAiStackEnv, getExecSemaphoreSnapshots, type AiStackEnv } from "./aistack.ts";
+import { maybeSummarize } from "./compact.ts";
 import { AnthropicRequest } from "./schemas.ts";
 import { decideRoute } from "./route.ts";
 import { Circuit } from "./resilience/circuit.ts";
@@ -192,8 +193,13 @@ app.post("/v1/messages", async (c) => {
     );
   }
 
+  // Optional async compaction: if FORKY_SUMMARIZE_THRESHOLD is set and the
+  // conversation is long, fold older history into a single summary system
+  // block via gemma-micro before the actual dispatch.
+  const compactedBody = await maybeSummarize(routedBody);
+
   if (isStream) {
-    const result = await dispatchAiStackStreaming(routedBody, aiStackEnv, WATCHDOG);
+    const result = await dispatchAiStackStreaming(compactedBody, aiStackEnv, WATCHDOG);
     if (result.status !== 200) {
       circuit.recordFailure();
       incAiStackFailure();
@@ -226,7 +232,7 @@ app.post("/v1/messages", async (c) => {
   }
 
   // Non-streaming AI Stack path.
-  const { status, body: outBody } = await dispatchAiStackNonStreaming(body, aiStackEnv);
+  const { status, body: outBody } = await dispatchAiStackNonStreaming(compactedBody, aiStackEnv);
   if (status !== 200) {
     circuit.recordFailure();
     incAiStackFailure();
