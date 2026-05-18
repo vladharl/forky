@@ -1,7 +1,23 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { pickProvider } from "../src/route.ts";
+import { existsSync, unlinkSync, renameSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
+const SENTINEL = join(homedir(), ".forky", "opus");
+const STASH = `${SENTINEL}.test-stash`;
 
 describe("pickProvider", () => {
+  // pickProvider consults the sentinel file. Move any real one aside so we
+  // test the default routing in isolation, then restore on teardown.
+  beforeEach(() => {
+    if (existsSync(SENTINEL)) renameSync(SENTINEL, STASH);
+  });
+  afterEach(() => {
+    if (existsSync(SENTINEL)) unlinkSync(SENTINEL);
+    if (existsSync(STASH)) renameSync(STASH, SENTINEL);
+  });
+
   test("claude-opus-* → anthropic-oauth", () => {
     expect(pickProvider("claude-opus-4-7")).toBe("anthropic-oauth");
     expect(pickProvider("claude-opus-4-6")).toBe("anthropic-oauth");
