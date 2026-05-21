@@ -79,3 +79,34 @@ describe("prompt caching markers on OAuth path", () => {
     expect(sent.system[sent.system.length - 1].cache_control).toEqual({ type: "ephemeral" });
   });
 });
+
+describe("cache-busting cch nonce normalization", () => {
+  const sysWith = (cch: string) => [
+    { type: "text", text: `x-anthropic-billing-header: cc_version=2.1.143.7a0; cc_entrypoint=claude-vscode; cch=${cch};\n\nYou are Claude Code, the full prompt.` },
+  ];
+
+  test("rotating cch values produce a byte-identical system prefix", async () => {
+    const a = await captureFetch({ model: "claude-opus-4-7", max_tokens: 10, messages: [{ role: "user", content: "hi" }], system: sysWith("32033") as any });
+    const b = await captureFetch({ model: "claude-opus-4-7", max_tokens: 10, messages: [{ role: "user", content: "hi" }], system: sysWith("da3ac") as any });
+    const sysA = JSON.parse(String(a.init.body)).system;
+    const sysB = JSON.parse(String(b.init.body)).system;
+    expect(JSON.stringify(sysA)).toEqual(JSON.stringify(sysB));
+    // Nonce normalized to the constant, rest of the line intact.
+    const billing = sysA.find((blk: any) => typeof blk.text === "string" && blk.text.includes("cch="));
+    expect(billing.text).toContain("cch=forky;");
+    expect(billing.text).toContain("cc_version=2.1.143.7a0");
+    expect(billing.text).not.toMatch(/cch=[0-9a-f]{4,};/);
+  });
+
+  test("respects FORKY_NORMALIZE_CCH=off", async () => {
+    process.env.FORKY_NORMALIZE_CCH = "off";
+    try {
+      const cap = await captureFetch({ model: "claude-opus-4-7", max_tokens: 10, messages: [{ role: "user", content: "hi" }], system: sysWith("abc12") as any });
+      const sys = JSON.parse(String(cap.init.body)).system;
+      const billing = sys.find((blk: any) => typeof blk.text === "string" && blk.text.includes("cch="));
+      expect(billing.text).toContain("cch=abc12;");
+    } finally {
+      delete process.env.FORKY_NORMALIZE_CCH;
+    }
+  });
+});

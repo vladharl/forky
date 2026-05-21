@@ -174,9 +174,45 @@ function truncateConsumedToolResults(messages: AnthropicRequest["messages"]): An
   });
 }
 
+// Replace base64 image blocks in already-consumed user turns with a one-line
+// placeholder. A screenshot attachment is ~100K tokens of base64; once the
+// model has reasoned about it (i.e. a later user turn exists), re-sending the
+// full payload every turn just bloats context — past qwen-35b's 128K window in
+// long sessions — without adding information. The MOST RECENT image-bearing user
+// message is kept intact (the model may still be looking at it). HTTP-URL images
+// are left alone (cheap to reference). Disable via FORKY_TRUNCATE_IMAGES=off.
+function truncateConsumedImages(messages: AnthropicRequest["messages"]): AnthropicRequest["messages"] {
+  if (process.env.FORKY_TRUNCATE_IMAGES === "off") return messages;
+
+  const hasBase64Image = (m: { role: string; content: unknown }): boolean =>
+    m.role === "user" && Array.isArray(m.content)
+    && m.content.some((b) => (b as { type?: string }).type === "image"
+      && (b as { source?: { type?: string } }).source?.type === "base64");
+
+  let lastImageIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (hasBase64Image(messages[i])) { lastImageIdx = i; break; }
+  }
+  if (lastImageIdx < 0) return messages;
+
+  return messages.map((msg, i) => {
+    if (i === lastImageIdx) return msg; // keep the freshest image intact
+    if (msg.role !== "user" || !Array.isArray(msg.content)) return msg;
+    let touched = false;
+    const newContent = msg.content.map((block) => {
+      const b = block as { type?: string; source?: { type?: string; media_type?: string; data?: string } };
+      if (b.type !== "image" || b.source?.type !== "base64") return block;
+      touched = true;
+      const kb = Math.round((b.source.data?.length ?? 0) / 1024);
+      return { type: "text" as const, text: `[image attachment (${b.source.media_type ?? "image"}, ~${kb}KB) from an earlier turn — omitted; described in surrounding messages]` };
+    });
+    return touched ? { ...msg, content: newContent } : msg;
+  });
+}
+
 export function translateRequest(req: AnthropicRequest, opts: TranslateOptions): AiStackRequest {
   const messages: OpenAiMessage[] = [];
-  const turnMessages = truncateConsumedToolResults(trimToCurrentTurn(req.messages));
+  const turnMessages = truncateConsumedImages(truncateConsumedToolResults(trimToCurrentTurn(req.messages)));
 
   // System prompt: flatten string-or-array form into one OpenAI system message,
   // then append the tool-format override so it has maximum recency.

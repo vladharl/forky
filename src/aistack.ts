@@ -52,15 +52,27 @@ function pickSemaphore(label: string): Semaphore {
  * Label suffix "rectifier.gemma" routes to the gemma pool; everything else
  * goes through the primary (qwen) pool.
  */
-export async function execFetch(url: string, init: RequestInit, label: string): Promise<Response> {
+export async function execFetch(
+  url: string,
+  init: RequestInit,
+  label: string,
+  retryStatuses?: number[],
+): Promise<Response> {
   return withSemaphore(pickSemaphore(label), () =>
     fetchWithRetryOn429(url, init, {
       maxAttempts: EXEC_429_ATTEMPTS,
       baseDelayMs: EXEC_429_BASE_DELAY_MS,
       label,
+      retryStatuses,
     }),
   );
 }
+
+// Transient upstream statuses worth a same-provider retry before we spend a
+// pricier OAuth fallback. AI Stack's 500s arrive in short capacity bursts and
+// clear within a second or two (observed in logs), so a couple of quick retries
+// recover most of them without burning the Max subscription on execution work.
+const EXEC_TRANSIENT_RETRY_STATUSES = [429, 500, 502, 503, 504];
 
 function getReformatModel(): string | null {
   return process.env.EXEC_REFORMAT_MODEL ?? process.env.AISTACK_REFORMAT_MODEL ?? null;
@@ -299,6 +311,25 @@ async function dispatchWithRectifier(
     toolCount: translated.tools?.length ?? 0,
   });
 
+  // Opt-in deep capture: when ~/.forky/capture.flag exists, dump the full
+  // outgoing request + primary's parsed response to ~/.forky/debug/req-*.json
+  // so we can analyze qwen's actual tool-call patterns offline. Auto-cleaned
+  // by deleting the flag.
+  try {
+    const { existsSync, writeFileSync, mkdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { homedir } = await import("node:os");
+    if (existsSync(join(homedir(), ".forky", "capture.flag"))) {
+      const dir = join(homedir(), ".forky", "debug");
+      mkdirSync(dir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      writeFileSync(join(dir, `req-${stamp}.json`), JSON.stringify({
+        ts: new Date().toISOString(),
+        request: translated,
+      }, null, 2));
+    }
+  } catch { /* never break a real request because of diag */ }
+
   // Always return 200 + a stream. All upstream work happens inside the stream's
   // start() so we can emit SSE keep-alive heartbeats while waiting on the
   // primary, and fall back to OAuth Sonnet in-band on failure.
@@ -336,7 +367,7 @@ async function dispatchWithRectifier(
             },
             body: JSON.stringify(translated),
             signal: primarySignal,
-          }, "aistack.rectifier.primary");
+          }, "aistack.rectifier.primary", EXEC_TRANSIENT_RETRY_STATUSES);
           if (!upstream.ok) {
             const text = await upstream.text().catch(() => "");
             log("error", "aistack.upstream_error", { status: upstream.status, path: "rectifier", body: text.slice(0, 300) });

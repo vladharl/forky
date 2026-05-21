@@ -27,7 +27,7 @@ export async function forwardOAuth(
   signal?: AbortSignal,
   clientHeaders?: Record<string, string>,
 ): Promise<Response> {
-  const prepared = addCachingMarkers(stripUnsupportedFields(injectSystemBlock(body)));
+  const prepared = addCachingMarkers(normalizeCacheBustingTokens(stripUnsupportedFields(injectSystemBlock(body))));
   let token = await getAccessToken();
   let res = await callAnthropic(token, prepared, signal, clientHeaders);
   if (res.status === 401) {
@@ -44,6 +44,33 @@ function stripUnsupportedFields(body: AnthropicBody): AnthropicBody {
     if (f in out) delete (out as Record<string, unknown>)[f];
   }
   return out;
+}
+
+// Claude Code prepends a billing telemetry line to its first system block:
+//   "x-anthropic-billing-header: cc_version=...; cc_entrypoint=...; cch=<nonce>;\n\n"
+// The `cch=` nonce ROTATES on every request. Since prompt caching keys on a
+// byte-stable prefix and this line sits at the very front of the cached system
+// prefix, the rotating nonce invalidates the cache on every call — observed as
+// cache_read_input_tokens=0 across all OAuth traffic. Normalizing the nonce to a
+// constant makes the prefix stable so the ~30K-token system prompt + ~10K-token
+// tools[] actually cache (5min TTL). The nonce is request-correlation telemetry,
+// not load-bearing for completion behavior. Disable via FORKY_NORMALIZE_CCH=off.
+const CCH_RE = /(cch=)[0-9a-fA-F]+/g;
+
+function normalizeCacheBustingTokens(body: AnthropicBody): AnthropicBody {
+  if (process.env.FORKY_NORMALIZE_CCH === "off") return body;
+  if (!Array.isArray(body.system)) return body;
+  let touched = false;
+  const system = body.system.map((blk) => {
+    const b = blk as { type: string; text?: string };
+    if (b.type !== "text" || typeof b.text !== "string" || !b.text.includes("cch=")) return blk;
+    const text = b.text.replace(CCH_RE, "$1forky");
+    if (text === b.text) return blk;
+    touched = true;
+    return { ...b, text };
+  });
+  if (!touched) return body;
+  return { ...body, system };
 }
 
 /**

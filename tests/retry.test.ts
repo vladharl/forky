@@ -53,12 +53,28 @@ describe("fetchWithRetryOn429", () => {
     expect(elapsed).toBeLessThan(1000); // retry-after=0 should be near-immediate (NOT the 5s default)
   });
 
-  test("5xx is NOT retried (caller handles)", async () => {
+  test("5xx is NOT retried by default (caller handles)", async () => {
     const m = mockFetch([{ status: 500, body: "bork" }]);
     teardown = m.restore;
     const res = await fetchWithRetryOn429("http://x", {}, { maxAttempts: 3, baseDelayMs: 1 });
     expect(res.status).toBe(500);
     expect(m.calls()).toBe(1);
+  });
+
+  test("transient 5xx IS retried when in retryStatuses, then recovers", async () => {
+    const m = mockFetch([{ status: 500, body: "burst" }, { status: 502 }, { status: 200, body: "ok" }]);
+    teardown = m.restore;
+    const res = await fetchWithRetryOn429("http://x", {}, { maxAttempts: 3, baseDelayMs: 1, retryStatuses: [429, 500, 502, 503, 504] });
+    expect(res.status).toBe(200);
+    expect(m.calls()).toBe(3);
+  });
+
+  test("persistent 5xx exhausts retries and returns last 5xx for fallback", async () => {
+    const m = mockFetch([{ status: 500 }, { status: 500 }, { status: 500 }]);
+    teardown = m.restore;
+    const res = await fetchWithRetryOn429("http://x", {}, { maxAttempts: 3, baseDelayMs: 1, retryStatuses: [500] });
+    expect(res.status).toBe(500);
+    expect(m.calls()).toBe(3);
   });
 
   test("aborted before retry stops retrying", async () => {
