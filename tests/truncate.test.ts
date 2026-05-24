@@ -111,7 +111,7 @@ describe("consumed-image truncation", () => {
     expect(lastHasImage).toBe(true);
   });
 
-  test("single image is never truncated (it's the latest)", () => {
+  test("single image with no assistant follow-up is kept (fresh prompt)", () => {
     const req = parseReq({
       model: "claude-sonnet-4-6",
       max_tokens: 100,
@@ -120,6 +120,28 @@ describe("consumed-image truncation", () => {
     const out = translateRequest(req, { stream: false });
     const u = (out.messages.find((m) => m.role === "user") as { content: any }).content;
     expect(JSON.stringify(u)).toContain(bigB64);
+  });
+
+  test("single image consumed by later assistant + tool turns IS truncated", () => {
+    // Mirrors the real-world session shape: user attaches a screenshot once at
+    // the start, then a long tool-chain unfolds. Without truncation the image
+    // gets re-sent on every rectifier call, blowing past qwen-35b's 128K window.
+    const req = parseReq({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      messages: [
+        { role: "user", content: [{ type: "text", text: "the game crashes" }, imgBlock] },
+        { role: "assistant", content: "I see the crash dialog in the screenshot." },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "/x" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+      ],
+    });
+    const out = translateRequest(req, { stream: false });
+    const userMsgs = out.messages.filter((m) => m.role === "user") as Array<{ content: any }>;
+    const firstUser = userMsgs[0].content;
+    const stillHasImage = Array.isArray(firstUser) && firstUser.some((p: any) => p.type === "image_url");
+    expect(stillHasImage).toBe(false);
+    expect(JSON.stringify(firstUser)).toContain("omitted");
   });
 
   test("FORKY_TRUNCATE_IMAGES=off keeps all images", () => {

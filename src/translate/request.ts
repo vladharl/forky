@@ -175,12 +175,14 @@ function truncateConsumedToolResults(messages: AnthropicRequest["messages"]): An
 }
 
 // Replace base64 image blocks in already-consumed user turns with a one-line
-// placeholder. A screenshot attachment is ~100K tokens of base64; once the
-// model has reasoned about it (i.e. a later user turn exists), re-sending the
-// full payload every turn just bloats context — past qwen-35b's 128K window in
-// long sessions — without adding information. The MOST RECENT image-bearing user
-// message is kept intact (the model may still be looking at it). HTTP-URL images
-// are left alone (cheap to reference). Disable via FORKY_TRUNCATE_IMAGES=off.
+// placeholder. A screenshot is ~100K tokens of base64; once the model has
+// reasoned about it (any assistant message follows), re-sending the full payload
+// on every subsequent rectifier call bloats context — past qwen-35b's 128K
+// window — without adding information. An image is kept intact ONLY if no
+// assistant message exists after it (i.e. it's the current user prompt we're
+// about to dispatch). With a single image attached at session start, every later
+// tool-chain turn truncates it. HTTP-URL images are left alone (cheap to
+// reference). Disable via FORKY_TRUNCATE_IMAGES=off.
 function truncateConsumedImages(messages: AnthropicRequest["messages"]): AnthropicRequest["messages"] {
   if (process.env.FORKY_TRUNCATE_IMAGES === "off") return messages;
 
@@ -189,14 +191,24 @@ function truncateConsumedImages(messages: AnthropicRequest["messages"]): Anthrop
     && m.content.some((b) => (b as { type?: string }).type === "image"
       && (b as { source?: { type?: string } }).source?.type === "base64");
 
-  let lastImageIdx = -1;
+  // Index of the last assistant message; any image at or before this point has
+  // been "responded to" and is safe to truncate.
+  let lastAssistantIdx = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (hasBase64Image(messages[i])) { lastImageIdx = i; break; }
+    if (messages[i].role === "assistant") { lastAssistantIdx = i; break; }
   }
-  if (lastImageIdx < 0) return messages;
+  if (lastAssistantIdx < 0) return messages; // no assistant turns yet — keep all images intact
+
+  // Need at least one image-bearing message that sits at or before the last
+  // assistant turn; otherwise nothing to truncate.
+  let hasConsumedImage = false;
+  for (let i = 0; i <= lastAssistantIdx; i++) {
+    if (hasBase64Image(messages[i])) { hasConsumedImage = true; break; }
+  }
+  if (!hasConsumedImage) return messages;
 
   return messages.map((msg, i) => {
-    if (i === lastImageIdx) return msg; // keep the freshest image intact
+    if (i > lastAssistantIdx) return msg; // image follows the last assistant — fresh, keep intact
     if (msg.role !== "user" || !Array.isArray(msg.content)) return msg;
     let touched = false;
     const newContent = msg.content.map((block) => {
