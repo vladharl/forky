@@ -74,6 +74,42 @@ export async function execFetch(
 // recover most of them without burning the Max subscription on execution work.
 const EXEC_TRANSIENT_RETRY_STATUSES = [429, 500, 502, 503, 504];
 
+// Hard token budget enforced before dispatch. Default 120K leaves headroom on
+// qwen-35b's 128K window for the response + tokenizer slack. Disable by setting
+// to 0. The escalation: try normal translate → if over budget, retry with
+// aggressive truncation (kill all base64 images, tighter tool_result min-bytes)
+// → if still over, dispatch anyway and let the upstream reject if it must.
+const TOKEN_BUDGET = Number(process.env.FORKY_TOKEN_BUDGET ?? 120_000);
+
+function estimateTokens(body: unknown): number {
+  return Math.round(JSON.stringify(body).length / 4);
+}
+
+/**
+ * Translate with an escalating retry if the result exceeds the token budget.
+ * Logs which tier was needed so we can see when aggressive truncation kicks in.
+ */
+function translateWithBudget(
+  req: import("./schemas.ts").AnthropicRequest,
+  stream: boolean,
+): import("./schemas.ts").AiStackRequest {
+  let translated = translateRequest(req, { stream });
+  if (TOKEN_BUDGET <= 0) return translated;
+  const t1 = estimateTokens(translated);
+  if (t1 <= TOKEN_BUDGET) return translated;
+
+  log("warn", "budget.over_escalating", { estTokens: t1, budget: TOKEN_BUDGET, tier: "aggressive" });
+  translated = translateRequest(req, { stream, aggressiveTruncate: true });
+  const t2 = estimateTokens(translated);
+  if (t2 <= TOKEN_BUDGET) {
+    log("info", "budget.recovered", { estTokens: t2, savedTokens: t1 - t2 });
+    return translated;
+  }
+
+  log("warn", "budget.still_over_after_aggressive", { estTokens: t2, budget: TOKEN_BUDGET });
+  return translated;
+}
+
 function getReformatModel(): string | null {
   return process.env.EXEC_REFORMAT_MODEL ?? process.env.AISTACK_REFORMAT_MODEL ?? null;
 }
@@ -104,7 +140,7 @@ export async function dispatchAiStackNonStreaming(
   env: AiStackEnv,
   signal?: AbortSignal,
 ): Promise<{ status: number; body: unknown }> {
-  const translated = translateRequest(req, { stream: false });
+  const translated = translateWithBudget(req, false);
 
   let upstream: Response;
   try {
@@ -192,7 +228,7 @@ export async function dispatchAiStackStreaming(
     return dispatchWithRectifier(req, env, reformatModel, externalSignal);
   }
 
-  const translated = translateRequest(req, { stream: true });
+  const translated = translateWithBudget(req, true);
   const abort = new AbortController();
   if (externalSignal) externalSignal.addEventListener("abort", () => abort.abort(externalSignal.reason));
 
@@ -300,7 +336,11 @@ async function dispatchWithRectifier(
   reformatModel: string,
   externalSignal?: AbortSignal,
 ): Promise<StreamingResult> {
-  const translated = translateRequest(req, { stream: false });
+  // Rectifier path uses non-streaming primary, so translate non-streamed shape.
+  // translateWithBudget runs the escalating truncation if normal output exceeds
+  // FORKY_TOKEN_BUDGET (default 120K) so we don't hand the model a request past
+  // its context window.
+  const translated = translateWithBudget(req, false);
   // Quick size telemetry — helps spot context bloat that pushes the primary
   // past its timeout. ~4 chars per token is the rough rule of thumb.
   const bodyChars = JSON.stringify(translated).length;

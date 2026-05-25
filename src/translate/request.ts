@@ -34,6 +34,10 @@ type OpenAiTool = { type: "function"; function: { name: string; description?: st
 export type TranslateOptions = {
   stream: boolean;
   validate?: boolean; // run Zod validation on the output (default true)
+  /** When true: also truncate the freshest base64 image, and use a tighter
+   * default min-byte threshold for tool_result truncation. Used by the
+   * token-budget escalation path when normal translation is still over budget. */
+  aggressiveTruncate?: boolean;
 };
 
 /**
@@ -115,10 +119,12 @@ function trimToCurrentTurn(messages: AnthropicRequest["messages"]): AnthropicReq
 // outputs often dominate context — past tool results aren't usually re-read,
 // only their existence + identity matters for the model's planning. Keeps the
 // most recent tool_result block(s) full (those haven't been "consumed" yet).
-function truncateConsumedToolResults(messages: AnthropicRequest["messages"]): AnthropicRequest["messages"] {
+function truncateConsumedToolResults(messages: AnthropicRequest["messages"], aggressive = false): AnthropicRequest["messages"] {
   // Read env at call time so tests / live config changes take effect without restart.
   if (process.env.FORKY_TRUNCATE_TOOL_RESULTS === "off") return messages;
-  const minBytes = Number(process.env.FORKY_TRUNCATE_MIN_BYTES ?? 500);
+  const minBytes = aggressive
+    ? Number(process.env.FORKY_TRUNCATE_MIN_BYTES_AGGRESSIVE ?? 100)
+    : Number(process.env.FORKY_TRUNCATE_MIN_BYTES ?? 500);
 
   // Build tool_use_id → { name, key arg preview } so placeholders carry context.
   const toolInfo = new Map<string, { name: string; argHint: string }>();
@@ -183,7 +189,7 @@ function truncateConsumedToolResults(messages: AnthropicRequest["messages"]): An
 // about to dispatch). With a single image attached at session start, every later
 // tool-chain turn truncates it. HTTP-URL images are left alone (cheap to
 // reference). Disable via FORKY_TRUNCATE_IMAGES=off.
-function truncateConsumedImages(messages: AnthropicRequest["messages"]): AnthropicRequest["messages"] {
+function truncateConsumedImages(messages: AnthropicRequest["messages"], aggressive = false): AnthropicRequest["messages"] {
   if (process.env.FORKY_TRUNCATE_IMAGES === "off") return messages;
 
   const hasBase64Image = (m: { role: string; content: unknown }): boolean =>
@@ -191,24 +197,29 @@ function truncateConsumedImages(messages: AnthropicRequest["messages"]): Anthrop
     && m.content.some((b) => (b as { type?: string }).type === "image"
       && (b as { source?: { type?: string } }).source?.type === "base64");
 
-  // Index of the last assistant message; any image at or before this point has
-  // been "responded to" and is safe to truncate.
-  let lastAssistantIdx = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "assistant") { lastAssistantIdx = i; break; }
+  // Aggressive mode: truncate every base64 image regardless of position.
+  // Normal mode: keep images that follow the last assistant message (still fresh).
+  let cutoffIdx: number; // truncate at indices <= cutoffIdx
+  if (aggressive) {
+    cutoffIdx = messages.length - 1;
+  } else {
+    let lastAssistantIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") { lastAssistantIdx = i; break; }
+    }
+    if (lastAssistantIdx < 0) return messages; // no assistant turns yet — keep all images intact
+    cutoffIdx = lastAssistantIdx;
   }
-  if (lastAssistantIdx < 0) return messages; // no assistant turns yet — keep all images intact
 
-  // Need at least one image-bearing message that sits at or before the last
-  // assistant turn; otherwise nothing to truncate.
+  // Need at least one image-bearing message in scope; otherwise nothing to do.
   let hasConsumedImage = false;
-  for (let i = 0; i <= lastAssistantIdx; i++) {
+  for (let i = 0; i <= cutoffIdx; i++) {
     if (hasBase64Image(messages[i])) { hasConsumedImage = true; break; }
   }
   if (!hasConsumedImage) return messages;
 
   return messages.map((msg, i) => {
-    if (i > lastAssistantIdx) return msg; // image follows the last assistant — fresh, keep intact
+    if (i > cutoffIdx) return msg; // out of scope — keep intact
     if (msg.role !== "user" || !Array.isArray(msg.content)) return msg;
     let touched = false;
     const newContent = msg.content.map((block) => {
@@ -224,7 +235,8 @@ function truncateConsumedImages(messages: AnthropicRequest["messages"]): Anthrop
 
 export function translateRequest(req: AnthropicRequest, opts: TranslateOptions): AiStackRequest {
   const messages: OpenAiMessage[] = [];
-  const turnMessages = truncateConsumedImages(truncateConsumedToolResults(trimToCurrentTurn(req.messages)));
+  const aggressive = opts.aggressiveTruncate === true;
+  const turnMessages = truncateConsumedImages(truncateConsumedToolResults(trimToCurrentTurn(req.messages), aggressive), aggressive);
 
   // System prompt: flatten string-or-array form into one OpenAI system message,
   // then append the tool-format override so it has maximum recency.

@@ -150,4 +150,47 @@ describe("consumed-image truncation", () => {
     const imageCount = JSON.stringify(out.messages).split(bigB64).length - 1;
     expect(imageCount).toBe(2);
   });
+
+  test("aggressiveTruncate=true drops even the freshest image", () => {
+    // The freshest image (no assistant follow-up) is normally kept intact;
+    // under aggressive mode, the budget escalator strips it too.
+    const req = parseReq({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      messages: [{ role: "user", content: [{ type: "text", text: "fresh look" }, imgBlock] }],
+    });
+    const normal = translateRequest(req, { stream: false });
+    const aggro = translateRequest(req, { stream: false, aggressiveTruncate: true });
+    expect(JSON.stringify(normal)).toContain(bigB64);
+    expect(JSON.stringify(aggro)).not.toContain(bigB64);
+    expect(JSON.stringify(aggro)).toContain("omitted");
+  });
+
+  test("aggressiveTruncate=true uses tighter tool_result min-bytes default", () => {
+    process.env.FORKY_TRUNCATE_MIN_BYTES = "10000"; // normally lenient
+    delete process.env.FORKY_TRUNCATE_MIN_BYTES_AGGRESSIVE; // use the 100 default
+    const medium = "y".repeat(300); // under normal threshold (10000), over aggressive (100)
+    const req = parseReq({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      messages: [
+        { role: "user", content: "do" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "/a" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: medium }] },
+        { role: "assistant", content: "ok" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t2", name: "Read", input: { file_path: "/b" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: medium }] },
+      ],
+    });
+    const normal = translateRequest(req, { stream: false });
+    const aggro = translateRequest(req, { stream: false, aggressiveTruncate: true });
+    // Normal: 300 < 10000 → both kept full → message contents == medium.
+    const normalTools = normal.messages.filter((m) => m.role === "tool") as Array<{ content: string }>;
+    expect(normalTools.every((m) => m.content === medium)).toBe(true);
+    // Aggressive: 300 > 100 → older one truncated to placeholder.
+    const aggroTools = aggro.messages.filter((m) => m.role === "tool") as Array<{ content: string }>;
+    expect(aggroTools[0].content).toMatch(/^\[Read.*consumed/);
+    expect(aggroTools[1].content).toBe(medium); // still the freshest
+    delete process.env.FORKY_TRUNCATE_MIN_BYTES;
+  });
 });
