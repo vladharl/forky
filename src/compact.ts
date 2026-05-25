@@ -25,9 +25,25 @@ export async function maybeSummarize(req: AnthropicRequest): Promise<AnthropicRe
   if (req.messages.length <= SUMMARIZE_THRESHOLD) return req;
 
   // Pick a split point at the midpoint, then advance to land on a user-message
-  // boundary so the kept tail starts with a valid Anthropic shape.
+  // boundary that's NOT just tool_result content. Some upstreams (AI Stack's
+  // qwen chat template) reject requests with no actual user query — and a user
+  // message whose only blocks are tool_result becomes a `tool`-role OpenAI msg
+  // after translation, contributing zero user-role messages. Require the kept
+  // tail to start with a real user prompt (text or image content present).
+  const isFreshUserPrompt = (m: AnthropicRequest["messages"][number]): boolean => {
+    if (m.role !== "user") return false;
+    const c = m.content as unknown;
+    if (typeof c === "string") return c.length > 0;
+    if (Array.isArray(c)) {
+      return c.some((b) => {
+        const t = (b as { type?: string }).type;
+        return t === "text" || t === "image";
+      });
+    }
+    return false;
+  };
   let split = Math.floor(req.messages.length / 2);
-  while (split < req.messages.length && req.messages[split].role !== "user") split++;
+  while (split < req.messages.length && !isFreshUserPrompt(req.messages[split])) split++;
   if (split >= req.messages.length || split === 0) return req;
 
   const oldHalf = req.messages.slice(0, split);
