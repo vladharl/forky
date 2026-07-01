@@ -66,6 +66,36 @@ describe("prompt caching markers on OAuth path", () => {
     expect(last.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
   });
 
+  test("downgrades later 1h system marker after a 5m system marker", async () => {
+    const cap = await captureFetch({
+      model: "claude-opus-4-7",
+      max_tokens: 10,
+      messages: [{ role: "user", content: "hi" }],
+      system: [
+        { type: "text", text: "block A", cache_control: { type: "ephemeral" } } as any,
+        { type: "text", text: "block B", cache_control: { type: "ephemeral", ttl: "1h" } } as any,
+      ],
+    });
+    const sent = JSON.parse(String(cap.init.body));
+    expect(sent.system.at(-2).cache_control).toEqual({ type: "ephemeral" });
+    expect(sent.system.at(-1).cache_control).toEqual({ type: "ephemeral", ttl: "5m" });
+  });
+
+  test("downgrades system 1h marker after an added 5m tool marker", async () => {
+    const cap = await captureFetch({
+      model: "claude-opus-4-7",
+      max_tokens: 10,
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ name: "Read", input_schema: {} }] as any,
+      system: [
+        { type: "text", text: "block A", cache_control: { type: "ephemeral", ttl: "1h" } } as any,
+      ],
+    });
+    const sent = JSON.parse(String(cap.init.body));
+    expect(sent.tools.at(-1).cache_control).toEqual({ type: "ephemeral" });
+    expect(sent.system.at(-1).cache_control).toEqual({ type: "ephemeral", ttl: "5m" });
+  });
+
   test("system as plain string is converted to array (existing injection behavior preserved)", async () => {
     const cap = await captureFetch({
       model: "claude-opus-4-7",

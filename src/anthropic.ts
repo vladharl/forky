@@ -27,7 +27,7 @@ export async function forwardOAuth(
   signal?: AbortSignal,
   clientHeaders?: Record<string, string>,
 ): Promise<Response> {
-  const prepared = addCachingMarkers(normalizeCacheBustingTokens(stripUnsupportedFields(injectSystemBlock(body))));
+  const prepared = normalizeCacheControlTtlOrder(addCachingMarkers(normalizeCacheBustingTokens(stripUnsupportedFields(injectSystemBlock(body)))));
   let token = await getAccessToken();
   let res = await callAnthropic(token, prepared, signal, clientHeaders);
   if (res.status === 401) {
@@ -103,6 +103,50 @@ function addCachingMarkers(body: AnthropicBody): AnthropicBody {
     }
   }
   return out;
+}
+
+/**
+ * Anthropic accepts multiple cache_control markers, but extended-cache markers
+ * (`ttl: "1h"`) must not appear after normal 5-minute markers in the processing
+ * order (tools, system, messages). Claude Code can send existing 1h markers;
+ * Forky may add a 5m marker to tools before those system blocks, which otherwise
+ * produces a 400. Preserve caching by downgrading later 1h markers to 5m.
+ */
+function normalizeCacheControlTtlOrder(body: AnthropicBody): AnthropicBody {
+  let sawFiveMinute = false;
+  let touched = false;
+
+  function normalizeBlock<T extends Record<string, unknown>>(block: T): T {
+    const cacheControl = block.cache_control;
+    if (!cacheControl || typeof cacheControl !== "object") return block;
+    const cc = cacheControl as Record<string, unknown>;
+    const ttl = cc.ttl === "1h" ? "1h" : "5m";
+    if (ttl === "5m") {
+      sawFiveMinute = true;
+      return block;
+    }
+    if (sawFiveMinute) {
+      touched = true;
+      return { ...block, cache_control: { ...cc, ttl: "5m" } };
+    }
+    return block;
+  }
+
+  const out: AnthropicBody = { ...body };
+  const tools = (out as { tools?: Array<Record<string, unknown>> }).tools;
+  if (Array.isArray(tools)) {
+    (out as { tools?: Array<Record<string, unknown>> }).tools = tools.map(normalizeBlock);
+  }
+  const system = out.system;
+  if (Array.isArray(system)) {
+    out.system = system.map((block) => normalizeBlock(block as Record<string, unknown>)) as typeof system;
+  }
+  const messages = (out as { messages?: Array<Record<string, unknown>> }).messages;
+  if (Array.isArray(messages)) {
+    (out as { messages?: Array<Record<string, unknown>> }).messages = messages.map(normalizeBlock);
+  }
+
+  return touched ? out : body;
 }
 
 /**
